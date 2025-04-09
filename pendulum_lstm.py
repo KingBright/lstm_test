@@ -7,6 +7,52 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import torch
+import platform
+import matplotlib as mpl
+import warnings
+import logging
+
+# 抑制Matplotlib的字体警告
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+# 抑制Matplotlib的字体日志
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+
+# 设置中文字体支持
+def setup_chinese_font():
+    system = platform.system()
+    
+    # 尝试设置适合当前系统的字体
+    try:
+        if system == 'Darwin':  # macOS
+            font_list = ['Arial Unicode MS', 'PingFang SC', 'Heiti SC', 'STHeiti']
+            for font in font_list:
+                try:
+                    plt.rcParams['font.family'] = [font]
+                    # 测试字体是否有效
+                    fig = plt.figure(figsize=(1, 1))
+                    plt.text(0.5, 0.5, '测试中文', ha='center', va='center')
+                    plt.close(fig)
+                    print(f"成功设置中文字体: {font}")
+                    break
+                except Exception:
+                    continue
+        elif system == 'Windows':
+            plt.rcParams['font.family'] = ['Microsoft YaHei', 'SimHei']
+        elif system == 'Linux':
+            plt.rcParams['font.family'] = ['WenQuanYi Micro Hei', 'DejaVu Sans']
+        
+        # 通用设置
+        plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+        plt.rcParams['font.size'] = 12
+    except Exception as e:
+        print(f"设置中文字体时发生错误，将使用默认字体: {e}")
+        # 在出错时使用默认设置
+        plt.rcParams['font.family'] = ['sans-serif']
+        # 设置中文标题的备用方案
+        plt.rcParams['axes.titlepad'] = 20  # 增加标题间距以避免中文被截断
+
+# 应用中文字体设置
+setup_chinese_font()
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
@@ -397,10 +443,10 @@ def prepare_data_for_training(df, sequence_length=10, test_split=0.2):
 # 步骤 4：构建循环神经网络模型
 #############################################
 
-class PendulumLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dense_units, dropout=0.2):
+class PhysicsAugmentedLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dense_units, dropout=0.2, physics_enabled=True):
         """
-        增强版LSTM模型用于单摆状态预测
+        物理增强型LSTM模型，结合物理方程与神经网络
         
         参数:
         input_size (int): 输入特征数
@@ -409,10 +455,19 @@ class PendulumLSTM(nn.Module):
         output_size (int): 输出特征数
         dense_units (int): 中间全连接层的单元数
         dropout (float): Dropout比率，用于防止过拟合
+        physics_enabled (bool): 是否启用物理模型增强
         """
-        super(PendulumLSTM, self).__init__()
+        super(PhysicsAugmentedLSTM, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.physics_enabled = physics_enabled
+        
+        # 物理模型参数
+        self.m = nn.Parameter(torch.tensor(1.0), requires_grad=True)  # 质量参数可学习
+        self.L = nn.Parameter(torch.tensor(1.0), requires_grad=True)  # 长度参数可学习
+        self.g = nn.Parameter(torch.tensor(9.81), requires_grad=False)  # 重力常数
+        self.c = nn.Parameter(torch.tensor(0.5), requires_grad=True)   # 阻尼系数可学习
+        self.dt = nn.Parameter(torch.tensor(0.02), requires_grad=False)  # 时间步长
         
         # 输入层的归一化
         self.input_norm = nn.LayerNorm(input_size)
@@ -445,10 +500,10 @@ class PendulumLSTM(nn.Module):
             nn.Linear(hidden_size, 1)
         )
         
-        # 全连接网络 - 更深的全连接层
-        self.fc_network = nn.Sequential(
-            nn.BatchNorm1d(hidden_size),
-            nn.Linear(hidden_size, dense_units),
+        # 神经网络修正器 - 学习物理模型的残差
+        self.corrector_net = nn.Sequential(
+            nn.BatchNorm1d(hidden_size + input_size),  # 接收LSTM特征和物理模型输入
+            nn.Linear(hidden_size + input_size, dense_units),
             nn.LeakyReLU(),
             nn.Dropout(dropout),
             nn.Linear(dense_units, dense_units//2),
@@ -457,11 +512,43 @@ class PendulumLSTM(nn.Module):
             nn.Linear(dense_units//2, output_size)
         )
         
-        # 残差连接 - 直接从输入到输出的连接，帮助梯度流动
-        self.residual = nn.Linear(input_size, output_size)
+        # 物理/神经网络集成器 - 学习如何混合两个模型的输出
+        self.integration_net = nn.Sequential(
+            nn.Linear(output_size * 2, dense_units//2),  # 接收物理模型和神经网络的输出
+            nn.ReLU(),
+            nn.Linear(dense_units//2, 1),
+            nn.Sigmoid()  # 输出一个0-1之间的权重
+        )
         
         # 输出层的归一化
         self.output_norm = nn.LayerNorm(output_size)
+        
+    def physics_step(self, state, tau):
+        """
+        使用物理模型计算下一个状态
+        
+        参数:
+        state (tensor): 当前状态 [theta, theta_dot]
+        tau (tensor): 外部力矩
+        
+        返回:
+        tensor: 下一个状态 [theta_next, theta_dot_next]
+        """
+        # 将输入解包
+        theta, theta_dot = state[:, 0], state[:, 1]
+        
+        # 计算参数
+        beta = self.c / (self.m * self.L**2)
+        omega0_sq = self.g / self.L
+        
+        # 计算下一个状态
+        theta_next = theta + self.dt * theta_dot
+        theta_dot_next = theta_dot + self.dt * (-beta * theta_dot - 
+                                               omega0_sq * torch.sin(theta) + 
+                                               tau / (self.m * self.L**2))
+        
+        # 将结果重新打包
+        return torch.stack([theta_next, theta_dot_next], dim=1)
         
     def attention_net(self, lstm_output):
         """
@@ -484,8 +571,10 @@ class PendulumLSTM(nn.Module):
         """
         batch_size, seq_len, _ = x.size()
         
-        # 保存原始输入的最后一个时间步，用于残差连接
-        residual_input = x[:, -1, :]
+        # 获取最后时间步的状态和力矩，用于物理模型
+        last_step = x[:, -1, :]
+        current_state = last_step[:, :2]  # theta, theta_dot
+        current_tau = last_step[:, 2]     # tau
         
         # 输入归一化
         x = self.input_norm(x)
@@ -500,19 +589,33 @@ class PendulumLSTM(nn.Module):
         # 应用注意力机制
         context = self.attention_net(lstm2_out)
         
-        # 通过全连接网络
-        out = self.fc_network(context)
-        
-        # 应用残差连接 - 直接从输入的最后时间步到输出
-        residual_out = self.residual(residual_input)
-        
-        # 结合残差连接和主要输出
-        combined_out = out + residual_out
+        # 物理模型计算 (如果启用)
+        if self.physics_enabled:
+            physics_prediction = self.physics_step(current_state, current_tau)
+            
+            # 将LSTM特征和当前状态连接，用于修正物理模型
+            combined_features = torch.cat([context, last_step], dim=1)
+            
+            # 神经网络修正
+            nn_correction = self.corrector_net(combined_features)
+            
+            # 神经网络原始预测
+            nn_prediction = nn_correction + current_state  # 残差学习
+            
+            # 计算混合权重 - 物理模型和神经网络预测的加权平均
+            inputs_for_integration = torch.cat([physics_prediction, nn_prediction], dim=1)
+            physics_weight = self.integration_net(inputs_for_integration)
+            
+            # 最终预测是物理模型和神经网络预测的加权平均
+            final_output = physics_weight * physics_prediction + (1 - physics_weight) * nn_prediction
+        else:
+            # 不使用物理模型时，只依赖神经网络预测
+            final_output = self.corrector_net(torch.cat([context, last_step], dim=1)) + current_state
         
         # 输出归一化
-        final_out = self.output_norm(combined_out)
+        final_output = self.output_norm(final_output)
         
-        return final_out
+        return final_output
 
 #############################################
 # 步骤 5：训练神经网络
@@ -571,8 +674,8 @@ def train_model(model, train_loader, test_loader, num_epochs=50, learning_rate=0
         # inputs 形状为 [batch_size, seq_len, features]，其中features包含 [theta, theta_dot, tau]
         # outputs 形状为 [batch_size, 2]，包含预测的 [theta, theta_dot]
         
-        # 物理约束权重
-        physics_weight = 0.1
+        # 物理约束权重 - 增加物理约束的重要性
+        physics_weight = 0.5  # 从0.1增加到0.5，让物理约束占更大比重
         
         # 获取上一个时间步的状态和输入力矩
         prev_theta = inputs[:, -1, 0]        # 上一时间步的theta
@@ -816,9 +919,10 @@ def evaluate_model(model, test_loader, criterion, device=None):
     return avg_loss
 
 def multi_step_prediction(model, initial_sequence, df, sequence_length, prediction_steps, 
-                         input_scaler, output_scaler, device=None, use_error_correction=True, teacher_forcing_ratio=0.3):
+                         input_scaler, output_scaler, device=None, use_error_correction=True, 
+                         teacher_forcing_ratio=0.0, pure_physics_ratio=0.5):
     """
-    使用模型进行多步预测 - 增强版，带误差校正
+    使用物理增强模型进行多步预测
     
     参数:
     model (nn.Module): 训练好的模型
@@ -831,9 +935,10 @@ def multi_step_prediction(model, initial_sequence, df, sequence_length, predicti
     device (torch.device): 计算设备
     use_error_correction (bool): 是否使用误差校正
     teacher_forcing_ratio (float): 教师强制比例，用于混合预测值和真实值
+    pure_physics_ratio (float): 纯物理模型权重，0表示完全使用神经网络，1表示完全使用物理模型
     
     返回:
-    tuple: 预测状态和真实状态
+    tuple: 预测状态、真实状态和纯物理模型预测
     """
     if device is None:
         if torch.backends.mps.is_available():
@@ -849,17 +954,41 @@ def multi_step_prediction(model, initial_sequence, df, sequence_length, predicti
     current_sequence = initial_sequence.copy()
     
     # 存储预测结果
-    predicted_states_scaled = []
-    predicted_states_corrected = []  # 存储校正后的状态
+    predicted_states_scaled = []     # 神经网络原始预测
+    predicted_states_corrected = []  # 校正后的状态
+    pure_physics_states = []         # 纯物理模型预测
     
     # 开始索引 (初始序列之后的第一个时间步)
     start_index = df.index[sequence_length]
     
-    # 物理模型参数 - 用于误差校正
-    g = 9.81       # 重力加速度 (m/s²)
-    m = 1.0        # 质量 (kg)
-    L = 1.0        # 摆长 (m)
-    c = 0.5        # 阻尼系数 (N·m·s/rad)
+    # 保存物理模型和神经网络的混合模式
+    if hasattr(model, 'physics_enabled'):
+        is_physics_model = model.physics_enabled
+    else:
+        is_physics_model = False
+        
+    print(f"多步预测模式: {'物理增强' if is_physics_model else '纯神经网络'}, "
+          f"纯物理模型权重: {pure_physics_ratio:.2f}")
+          
+    # 启用评估模式下的梯度计算，以便可视化物理权重
+    # 通常在eval模式下不需要梯度，但这里我们想了解模型的行为
+    torch.set_grad_enabled(True)
+    
+    # 获取模型中学到的物理参数，如果是物理增强模型
+    if hasattr(model, 'physics_enabled') and model.physics_enabled:
+        # 使用模型学习的物理参数
+        g = model.g.item()
+        m = model.m.item()
+        L = model.L.item()
+        c = model.c.item()
+        print(f"使用模型学习到的物理参数: m={m:.3f}, L={L:.3f}, c={c:.3f}")
+    else:
+        # 使用默认物理参数
+        g = 9.81       # 重力加速度 (m/s²)
+        m = 1.0        # 质量 (kg)
+        L = 1.0        # 摆长 (m)
+        c = 0.5        # 阻尼系数 (N·m·s/rad)
+    
     dt = df['time'].iloc[1] - df['time'].iloc[0]  # 时间步长
     
     # 物理模型辅助函数
@@ -911,7 +1040,7 @@ def multi_step_prediction(model, initial_sequence, df, sequence_length, predicti
     prev_error_theta = 0
     prev_error_theta_dot = 0
     
-    with torch.no_grad():
+    with torch.set_grad_enabled(False):  # 关闭梯度计算以加速预测
         for i in range(prediction_steps):
             # 转换当前序列为tensor
             current_sequence_tensor = torch.tensor(
@@ -919,63 +1048,93 @@ def multi_step_prediction(model, initial_sequence, df, sequence_length, predicti
                 dtype=torch.float32
             ).to(device)
             
-            # 预测下一状态
+            # 获取当前状态和力矩 (用于物理模型)
+            current_state = output_scaler.inverse_transform(current_sequence[-1, :2].reshape(1, -1))[0]
+            current_theta, current_theta_dot = current_state
+            
+            # 获取当前时间步的力矩
+            next_tau_original = df.iloc[start_index + i]['tau']
+            
+            # 预测下一状态 - 使用神经网络
             next_state_scaled_tensor = model(current_sequence_tensor)
             next_state_scaled = next_state_scaled_tensor.cpu().numpy()
             
-            # 存储未校正的预测状态
+            # 存储神经网络原始预测
             predicted_states_scaled.append(next_state_scaled[0])
             
-            # 逆归一化预测状态
-            next_state_original = output_scaler.inverse_transform(next_state_scaled)[0]
-            pred_theta, pred_theta_dot = next_state_original
+            # 逆归一化神经网络预测
+            nn_prediction = output_scaler.inverse_transform(next_state_scaled)[0]
+            nn_theta, nn_theta_dot = nn_prediction
             
-            # 获取下一时间步的真实力矩和状态 (从原始数据)
-            true_row = df.iloc[start_index + i]
-            next_tau_original = true_row['tau']
-            true_theta = true_row['theta']
-            true_theta_dot = true_row['theta_dot']
-            
-            # 使用物理模型计算预测
-            if i == 0:
-                # 第一步使用初始序列的最后一个状态
-                last_sequence = output_scaler.inverse_transform(current_sequence[-1, :2].reshape(1, -1))[0]
-                last_theta, last_theta_dot = last_sequence
-            else:
-                # 后续步骤使用上一步的校正状态
-                last_theta, last_theta_dot = corrected_theta, corrected_theta_dot
-                
-            # 计算物理模型预测的下一状态
+            # 使用物理模型计算下一状态
             physics_theta, physics_theta_dot = physics_step(
-                last_theta, last_theta_dot, next_tau_original, dt
+                current_theta, current_theta_dot, next_tau_original, dt
             )
             
-            # 使用误差校正
-            if use_error_correction:
-                corrected_theta, corrected_theta_dot, prev_error_theta, prev_error_theta_dot = kalman_correct(
-                    pred_theta, pred_theta_dot, physics_theta, physics_theta_dot,
-                    prev_error_theta, prev_error_theta_dot
-                )
-            else:
-                corrected_theta, corrected_theta_dot = pred_theta, pred_theta_dot
+            # 存储纯物理模型预测
+            pure_physics_states.append([physics_theta, physics_theta_dot])
             
-            # 可选：应用教师强制 (在训练中非常有用，在测试时可以设置为0)
-            if teacher_forcing_ratio > 0:
-                corrected_theta = apply_teacher_forcing(corrected_theta, true_theta, teacher_forcing_ratio)
-                corrected_theta_dot = apply_teacher_forcing(corrected_theta_dot, true_theta_dot, teacher_forcing_ratio)
+            # 混合预测结果 - 结合物理模型和神经网络
+            # pure_physics_ratio控制物理模型的权重
+            hybrid_theta = pure_physics_ratio * physics_theta + (1 - pure_physics_ratio) * nn_theta
+            hybrid_theta_dot = pure_physics_ratio * physics_theta_dot + (1 - pure_physics_ratio) * nn_theta_dot
+            
+            # 如果启用误差校正，进一步优化预测
+            if use_error_correction:
+                # 获取真实状态 (仅用于计算误差)
+                true_row = df.iloc[start_index + i]
+                true_theta = true_row['theta']
+                true_theta_dot = true_row['theta_dot']
+                
+                # 自适应误差校正 - 根据历史预测准确度动态调整校正强度
+                if i > 0:
+                    # 获取真实状态 (仅用于计算误差)
+                    prev_true_row = df.iloc[start_index + i - 1]
+                    prev_true_state = np.array([prev_true_row['theta'], prev_true_row['theta_dot']])
+                    
+                    # 计算前一步预测的误差
+                    prev_nn_error = np.abs(nn_prediction - prev_true_state).mean()
+                    prev_physics_error = np.abs(pure_physics_states[i-1] - prev_true_state).mean()
+                    
+                    # 动态调整混合比例，更倾向于更准确的模型
+                    # 使用softmax函数使两种模型的权重和为1
+                    total_error = prev_nn_error + prev_physics_error
+                    if total_error > 0:
+                        # 误差越小，权重越大
+                        physics_weight = prev_nn_error / total_error
+                        nn_weight = prev_physics_error / total_error
+                    else:
+                        physics_weight = nn_weight = 0.5
+                    
+                    # 应用动态权重
+                    corrected_theta = physics_weight * physics_theta + nn_weight * nn_theta
+                    corrected_theta_dot = physics_weight * physics_theta_dot + nn_weight * nn_theta_dot
+                else:
+                    # 第一步使用预设混合比例
+                    corrected_theta = hybrid_theta
+                    corrected_theta_dot = hybrid_theta_dot
+                
+                # 可选：应用教师强制 (将预测值部分替换为真实值)
+                if teacher_forcing_ratio > 0:
+                    corrected_theta = (1 - teacher_forcing_ratio) * corrected_theta + teacher_forcing_ratio * true_theta
+                    corrected_theta_dot = (1 - teacher_forcing_ratio) * corrected_theta_dot + teacher_forcing_ratio * true_theta_dot
+            else:
+                # 不使用误差校正，直接使用混合预测
+                corrected_theta = hybrid_theta
+                corrected_theta_dot = hybrid_theta_dot
             
             # 存储校正后的状态
             corrected_state = np.array([corrected_theta, corrected_theta_dot])
             predicted_states_corrected.append(corrected_state)
             
-            # 归一化力矩和校正后的状态，用于下一步预测
+            # 归一化校正后的状态和下一个力矩，用于下一步预测
             dummy_input = np.zeros((1, 3))
             dummy_input[0, 0] = corrected_theta
             dummy_input[0, 1] = corrected_theta_dot
             dummy_input[0, 2] = next_tau_original
             next_features_scaled = input_scaler.transform(dummy_input)[0]
             
-            # 更新序列 (滚动窗口)
+            # 更新序列，滚动窗口
             current_sequence = np.append(
                 current_sequence[1:],
                 next_features_scaled.reshape(1, -1),
@@ -986,6 +1145,7 @@ def multi_step_prediction(model, initial_sequence, df, sequence_length, predicti
     predicted_states_scaled = np.array(predicted_states_scaled)
     predicted_states_original = output_scaler.inverse_transform(predicted_states_scaled)
     predicted_states_corrected = np.array(predicted_states_corrected)
+    pure_physics_states = np.array(pure_physics_states)
     
     # 获取真实状态进行比较
     true_states = df.iloc[start_index:start_index+prediction_steps][['theta', 'theta_dot']].values
@@ -993,13 +1153,21 @@ def multi_step_prediction(model, initial_sequence, df, sequence_length, predicti
     # 计算误差统计
     mse_original = np.mean((predicted_states_original - true_states)**2)
     mse_corrected = np.mean((predicted_states_corrected - true_states)**2)
-    print(f"原始预测MSE: {mse_original:.6f}, 校正后预测MSE: {mse_corrected:.6f}")
+    mse_physics = np.mean((pure_physics_states - true_states)**2)
     
-    # 返回校正后的预测，如果启用了校正
-    if use_error_correction:
-        return predicted_states_corrected, true_states
-    else:
-        return predicted_states_original, true_states
+    print(f"神经网络原始预测MSE: {mse_original:.6f}")
+    print(f"混合预测(校正后)MSE: {mse_corrected:.6f}")
+    print(f"纯物理模型预测MSE: {mse_physics:.6f}")
+    
+    # 计算相对性能比较
+    if mse_physics > 0:
+        nn_vs_physics = mse_physics / mse_original
+        corrected_vs_physics = mse_physics / mse_corrected
+        print(f"神经网络vs物理模型: {nn_vs_physics:.2f}x")
+        print(f"校正后vs物理模型: {corrected_vs_physics:.2f}x")
+    
+    # 返回校正后的预测和纯物理模型的预测
+    return predicted_states_corrected, true_states, pure_physics_states
 
 def plot_multi_step_prediction(time_vector, true_states, predicted_states, physics_model_predictions=None, model_name="LSTM"):
     """
@@ -1012,6 +1180,19 @@ def plot_multi_step_prediction(time_vector, true_states, predicted_states, physi
     physics_model_predictions (array, optional): 物理模型预测，用于比较
     model_name (str): 模型名称，用于标题
     """
+    # 定义一个函数来安全地设置标题和标签，避免中文显示问题
+    def safe_text(text, fallback_text=None):
+        if fallback_text is None:
+            fallback_text = text.replace('角度', 'Theta').replace('角速度', 'Theta_dot').replace('预测', 'Prediction')
+        try:
+            # 测试是否可以渲染文本
+            fig = plt.figure(figsize=(1, 1))
+            plt.text(0.5, 0.5, text, ha='center', va='center')
+            plt.close(fig)
+            return text
+        except Exception:
+            return fallback_text
+    
     # 为了更好的可视化，计算误差
     theta_error = np.abs(predicted_states[:, 0] - true_states[:, 0])
     theta_dot_error = np.abs(predicted_states[:, 1] - true_states[:, 1])
@@ -1032,70 +1213,70 @@ def plot_multi_step_prediction(time_vector, true_states, predicted_states, physi
     gs = plt.GridSpec(3, 2, figure=fig)
     
     # 顶部标题
-    fig.suptitle(f'多步预测分析: {model_name}模型\n', fontsize=16, fontweight='bold')
+    fig.suptitle(safe_text(f'多步预测分析: {model_name}模型\n', f'Multi-step Prediction: {model_name} Model\n'), fontsize=16, fontweight='bold')
     
     # 第一行：状态预测
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(time_vector, true_states[:, 0], 'g-', label='真实角度', linewidth=2)
-    ax1.plot(time_vector, predicted_states[:, 0], 'r--', label='预测角度', linewidth=2)
+    ax1.plot(time_vector, true_states[:, 0], 'g-', label=safe_text('真实角度', 'True Theta'), linewidth=2)
+    ax1.plot(time_vector, predicted_states[:, 0], 'r--', label=safe_text('预测角度', 'Predicted Theta'), linewidth=2)
     if physics_model_predictions is not None:
-        ax1.plot(time_vector, physics_model_predictions[:, 0], 'b-.', label='物理模型', linewidth=2)
-    ax1.set_title('角度 (θ) 预测', fontsize=14)
-    ax1.set_ylabel('角度 (rad)', fontsize=12)
-    ax1.text(0.02, 0.02, f'平均误差: {mean_theta_error:.4f} rad', transform=ax1.transAxes, 
+        ax1.plot(time_vector, physics_model_predictions[:, 0], 'b-.', label=safe_text('物理模型', 'Physics Model'), linewidth=2)
+    ax1.set_title(safe_text('角度 (θ) 预测', 'Theta (θ) Prediction'), fontsize=14)
+    ax1.set_ylabel(safe_text('角度 (rad)', 'Angle (rad)'), fontsize=12)
+    ax1.text(0.02, 0.02, safe_text(f'平均误差: {mean_theta_error:.4f} rad', f'Mean Error: {mean_theta_error:.4f} rad'), transform=ax1.transAxes, 
              bbox=dict(facecolor='white', alpha=0.8))
     ax1.legend(fontsize=10)
     ax1.grid(True)
     
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.plot(time_vector, true_states[:, 1], 'g-', label='真实角速度', linewidth=2)
-    ax2.plot(time_vector, predicted_states[:, 1], 'r--', label='预测角速度', linewidth=2)
+    ax2.plot(time_vector, true_states[:, 1], 'g-', label=safe_text('真实角速度', 'True Angular Velocity'), linewidth=2)
+    ax2.plot(time_vector, predicted_states[:, 1], 'r--', label=safe_text('预测角速度', 'Predicted Angular Velocity'), linewidth=2)
     if physics_model_predictions is not None:
-        ax2.plot(time_vector, physics_model_predictions[:, 1], 'b-.', label='物理模型', linewidth=2)
-    ax2.set_title('角速度 (θ̇) 预测', fontsize=14)
-    ax2.set_ylabel('角速度 (rad/s)', fontsize=12)
-    ax2.text(0.02, 0.02, f'平均误差: {mean_theta_dot_error:.4f} rad/s', transform=ax2.transAxes, 
+        ax2.plot(time_vector, physics_model_predictions[:, 1], 'b-.', label=safe_text('物理模型', 'Physics Model'), linewidth=2)
+    ax2.set_title(safe_text('角速度 (θ̇) 预测', 'Angular Velocity (θ̇) Prediction'), fontsize=14)
+    ax2.set_ylabel(safe_text('角速度 (rad/s)', 'Angular Velocity (rad/s)'), fontsize=12)
+    ax2.text(0.02, 0.02, safe_text(f'平均误差: {mean_theta_dot_error:.4f} rad/s', f'Mean Error: {mean_theta_dot_error:.4f} rad/s'), transform=ax2.transAxes, 
              bbox=dict(facecolor='white', alpha=0.8))
     ax2.legend(fontsize=10)
     ax2.grid(True)
     
     # 第二行：误差分析
     ax3 = fig.add_subplot(gs[1, 0])
-    ax3.plot(time_vector, theta_error, 'r-', label='角度误差', linewidth=2)
+    ax3.plot(time_vector, theta_error, 'r-', label=safe_text('角度误差', 'Theta Error'), linewidth=2)
     if physics_model_predictions is not None:
-        ax3.plot(time_vector, physics_theta_error, 'b-.', label='物理模型误差', linewidth=2)
-    ax3.set_title('角度预测误差', fontsize=14)
-    ax3.set_ylabel('|误差| (rad)', fontsize=12)
-    ax3.axhline(y=mean_theta_error, color='r', linestyle='--', alpha=0.5, label=f'平均误差: {mean_theta_error:.4f}')
+        ax3.plot(time_vector, physics_theta_error, 'b-.', label=safe_text('物理模型误差', 'Physics Model Error'), linewidth=2)
+    ax3.set_title(safe_text('角度预测误差', 'Theta Prediction Error'), fontsize=14)
+    ax3.set_ylabel(safe_text('|误差| (rad)', '|Error| (rad)'), fontsize=12)
+    ax3.axhline(y=mean_theta_error, color='r', linestyle='--', alpha=0.5, label=safe_text(f'平均误差: {mean_theta_error:.4f}', f'Mean Error: {mean_theta_error:.4f}'))
     if physics_model_predictions is not None:
         ax3.axhline(y=mean_physics_theta_error, color='b', linestyle='--', alpha=0.5, 
-                    label=f'物理模型平均误差: {mean_physics_theta_error:.4f}')
+                    label=safe_text(f'物理模型平均误差: {mean_physics_theta_error:.4f}', f'Physics Model Mean Error: {mean_physics_theta_error:.4f}'))
     ax3.legend(fontsize=10)
     ax3.grid(True)
     
     ax4 = fig.add_subplot(gs[1, 1])
-    ax4.plot(time_vector, theta_dot_error, 'r-', label='角速度误差', linewidth=2)
+    ax4.plot(time_vector, theta_dot_error, 'r-', label=safe_text('角速度误差', 'Angular Velocity Error'), linewidth=2)
     if physics_model_predictions is not None:
-        ax4.plot(time_vector, physics_theta_dot_error, 'b-.', label='物理模型误差', linewidth=2)
-    ax4.set_title('角速度预测误差', fontsize=14)
-    ax4.set_ylabel('|误差| (rad/s)', fontsize=12)
-    ax4.axhline(y=mean_theta_dot_error, color='r', linestyle='--', alpha=0.5, label=f'平均误差: {mean_theta_dot_error:.4f}')
+        ax4.plot(time_vector, physics_theta_dot_error, 'b-.', label=safe_text('物理模型误差', 'Physics Model Error'), linewidth=2)
+    ax4.set_title(safe_text('角速度预测误差', 'Angular Velocity Prediction Error'), fontsize=14)
+    ax4.set_ylabel(safe_text('|误差| (rad/s)', '|Error| (rad/s)'), fontsize=12)
+    ax4.axhline(y=mean_theta_dot_error, color='r', linestyle='--', alpha=0.5, label=safe_text(f'平均误差: {mean_theta_dot_error:.4f}', f'Mean Error: {mean_theta_dot_error:.4f}'))
     if physics_model_predictions is not None:
         ax4.axhline(y=mean_physics_theta_dot_error, color='b', linestyle='--', alpha=0.5, 
-                    label=f'物理模型平均误差: {mean_physics_theta_dot_error:.4f}')
+                    label=safe_text(f'物理模型平均误差: {mean_physics_theta_dot_error:.4f}', f'Physics Model Mean Error: {mean_physics_theta_dot_error:.4f}'))
     ax4.legend(fontsize=10)
     ax4.grid(True)
     
     # 第三行：相位图（角度 vs 角速度）和累积误差
     ax5 = fig.add_subplot(gs[2, 0])
-    ax5.plot(true_states[:, 0], true_states[:, 1], 'g-', label='真实轨迹', linewidth=2, alpha=0.8)
-    ax5.plot(predicted_states[:, 0], predicted_states[:, 1], 'r--', label='预测轨迹', linewidth=2, alpha=0.8)
+    ax5.plot(true_states[:, 0], true_states[:, 1], 'g-', label=safe_text('真实轨迹', 'True Trajectory'), linewidth=2, alpha=0.8)
+    ax5.plot(predicted_states[:, 0], predicted_states[:, 1], 'r--', label=safe_text('预测轨迹', 'Predicted Trajectory'), linewidth=2, alpha=0.8)
     if physics_model_predictions is not None:
         ax5.plot(physics_model_predictions[:, 0], physics_model_predictions[:, 1], 'b-.', 
-                label='物理模型轨迹', linewidth=2, alpha=0.8)
-    ax5.set_title('相位图：角度 vs 角速度', fontsize=14)
-    ax5.set_xlabel('角度 (rad)', fontsize=12)
-    ax5.set_ylabel('角速度 (rad/s)', fontsize=12)
+                label=safe_text('物理模型轨迹', 'Physics Model Trajectory'), linewidth=2, alpha=0.8)
+    ax5.set_title(safe_text('相位图：角度 vs 角速度', 'Phase Plot: Theta vs Angular Velocity'), fontsize=14)
+    ax5.set_xlabel(safe_text('角度 (rad)', 'Angle (rad)'), fontsize=12)
+    ax5.set_ylabel(safe_text('角速度 (rad/s)', 'Angular Velocity (rad/s)'), fontsize=12)
     ax5.legend(fontsize=10)
     ax5.grid(True)
     
@@ -1103,29 +1284,30 @@ def plot_multi_step_prediction(time_vector, true_states, predicted_states, physi
     ax6 = fig.add_subplot(gs[2, 1])
     cum_error_theta = np.cumsum(theta_error) / np.arange(1, len(theta_error) + 1)
     cum_error_theta_dot = np.cumsum(theta_dot_error) / np.arange(1, len(theta_dot_error) + 1)
-    ax6.plot(time_vector, cum_error_theta, 'r-', label='累积角度误差', linewidth=2)
-    ax6.plot(time_vector, cum_error_theta_dot, 'b-', label='累积角速度误差', linewidth=2)
+    ax6.plot(time_vector, cum_error_theta, 'r-', label=safe_text('累积角度误差', 'Cumulative Theta Error'), linewidth=2)
+    ax6.plot(time_vector, cum_error_theta_dot, 'b-', label=safe_text('累积角速度误差', 'Cumulative Angular Velocity Error'), linewidth=2)
     
     # 如果有物理模型，也画出其累积误差
     if physics_model_predictions is not None:
         cum_error_physics_theta = np.cumsum(physics_theta_error) / np.arange(1, len(physics_theta_error) + 1)
         cum_error_physics_theta_dot = np.cumsum(physics_theta_dot_error) / np.arange(1, len(physics_theta_dot_error) + 1)
-        ax6.plot(time_vector, cum_error_physics_theta, 'r--', label='物理模型累积角度误差', linewidth=2)
-        ax6.plot(time_vector, cum_error_physics_theta_dot, 'b--', label='物理模型累积角速度误差', linewidth=2)
+        ax6.plot(time_vector, cum_error_physics_theta, 'r--', label=safe_text('物理模型累积角度误差', 'Physics Model Cumulative Theta Error'), linewidth=2)
+        ax6.plot(time_vector, cum_error_physics_theta_dot, 'b--', label=safe_text('物理模型累积角速度误差', 'Physics Model Cumulative Angular Velocity Error'), linewidth=2)
     
-    ax6.set_title('累积平均误差', fontsize=14)
-    ax6.set_xlabel('时间 (s)', fontsize=12)
-    ax6.set_ylabel('累积平均误差', fontsize=12)
+    ax6.set_title(safe_text('累积平均误差', 'Cumulative Average Error'), fontsize=14)
+    ax6.set_xlabel(safe_text('时间 (s)', 'Time (s)'), fontsize=12)
+    ax6.set_ylabel(safe_text('累积平均误差', 'Cumulative Average Error'), fontsize=12)
     ax6.legend(fontsize=10)
     ax6.grid(True)
     
     # 为所有子图添加共享X轴标签
     for ax in [ax1, ax2, ax3, ax4]:
-        ax.set_xlabel('时间 (s)', fontsize=12)
+        ax.set_xlabel(safe_text('时间 (s)', 'Time (s)'), fontsize=12)
     
     # 额外信息
     fig.text(0.5, 0.01, 
-             f'预测步数: {len(time_vector)}   时间范围: {time_vector[0]:.2f}s - {time_vector[-1]:.2f}s', 
+             safe_text(f'预测步数: {len(time_vector)}   时间范围: {time_vector[0]:.2f}s - {time_vector[-1]:.2f}s', 
+                      f'Prediction Steps: {len(time_vector)}   Time Range: {time_vector[0]:.2f}s - {time_vector[-1]:.2f}s'), 
              ha='center', fontsize=12)
     
     plt.tight_layout(rect=[0, 0.02, 1, 0.97])  # 调整边距，为suptitle留出空间
@@ -1253,20 +1435,32 @@ def main():
     print(f"训练集形状: X={X_train_scaled.shape}, y={y_train_scaled.shape}")
     print(f"测试集形状: X={X_test_scaled.shape}, y={y_test_scaled.shape}")
     
-    # 步骤4: 构建增强版LSTM模型
+    # 步骤4: 构建物理增强LSTM模型
     # 定义模型参数
     input_size = X_train_scaled.shape[2]  # 输入特征数
-    hidden_size = 128                     # 增加LSTM隐藏单元数 (从96增加到128)
-    num_layers = 3                        # 增加LSTM层数 (从2增加到3)
+    hidden_size = 128                     # LSTM隐藏单元数
+    num_layers = 3                        # LSTM层数
     output_size = y_train_scaled.shape[1] # 输出特征数
-    dense_units = 96                      # 增加全连接层单元数 (从64增加到96)
-    dropout_rate = 0.25                   # 增加dropout以防止过拟合 (从0.2增加到0.25)
+    dense_units = 96                      # 全连接层单元数
+    dropout_rate = 0.25                   # Dropout比率
+    physics_enabled = True                # 启用物理模型增强
     
-    # 创建增强版模型
-    model = PendulumLSTM(input_size, hidden_size, num_layers, output_size, dense_units, dropout_rate)
+    # 创建物理增强模型
+    model = PhysicsAugmentedLSTM(
+        input_size, 
+        hidden_size, 
+        num_layers, 
+        output_size, 
+        dense_units, 
+        dropout_rate,
+        physics_enabled
+    )
     model.to(device)
-    print("步骤4: 已构建增强版LSTM模型")
+    print("步骤4: 已构建物理增强型LSTM模型")
     print(model)
+    
+    # 打印物理参数
+    print(f"物理参数(可学习): 质量={model.m.item():.2f}kg, 长度={model.L.item():.2f}m, 阻尼={model.c.item():.2f}")
     
     # 步骤5: 训练模型
     print("步骤5: 开始训练模型...")
@@ -1311,20 +1505,22 @@ def main():
     # 增强多步预测评估
     start_idx = 0  # 从测试集的开始
     initial_sequence = X_test_scaled[start_idx]
-    prediction_steps = min(300, len(df) - sequence_length - start_idx)  # 增加预测步数到300
+    prediction_steps = min(300, len(df) - sequence_length - start_idx)  # 预测步数
     
     print(f"执行多步预测，预测步数: {prediction_steps}")
     
     # 设置评估参数
-    use_error_correction = True
-    teacher_forcing_ratio = 0.0  # 在测试时不使用教师强制
+    use_error_correction = True      # 启用误差校正
+    teacher_forcing_ratio = 0.0      # 在测试时不使用教师强制
+    pure_physics_ratio = 0.7         # 增加物理模型在混合中的权重(从0.5增加到0.7)
     
     # 生成多步预测
-    predicted_states, true_states = multi_step_prediction(
+    predicted_states, true_states, physics_states = multi_step_prediction(
         model, initial_sequence, df, sequence_length, prediction_steps,
         input_scaler, output_scaler, device,
         use_error_correction=use_error_correction,
-        teacher_forcing_ratio=teacher_forcing_ratio
+        teacher_forcing_ratio=teacher_forcing_ratio,
+        pure_physics_ratio=pure_physics_ratio
     )
     
     # 生成纯物理模型预测作为参考
@@ -1374,8 +1570,8 @@ def main():
         time_vector, 
         true_states, 
         predicted_states, 
-        physics_model_predictions=physics_predictions,
-        model_name="LSTM增强版"
+        physics_model_predictions=physics_states,
+        model_name="物理增强型神经网络"
     )
     
     eval_time = time.time() - eval_start_time
@@ -1405,7 +1601,7 @@ def main():
     
     # 预测性能分析
     model_mse = np.mean((predicted_states - true_states) ** 2)
-    physics_mse = np.mean((physics_predictions - true_states) ** 2)
+    physics_mse = np.mean((physics_states - true_states) ** 2)
     performance_ratio = physics_mse / model_mse if model_mse > 0 else float('inf')
     
     print(f"\n模型多步预测MSE: {model_mse:.6f}")
