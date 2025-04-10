@@ -11,25 +11,24 @@ import time
 # Import necessary modules from the project
 import config
 import utils
-from model import get_model, PureLSTM, PureGRU
+from model import get_model # Use the factory function
+# Import functions needed for data generation and physics comparison
 from data_generation import PendulumSystem, generate_simulation_data, run_simulation
-from data_preprocessing import get_test_data_and_scalers
+# Import sequence creation and potentially scaler loading helper (if needed)
+from data_preprocessing import create_sequences # Need this to process generated segment
 # Import necessary evaluation functions
-# Ensure run_multi_scenario_evaluation is imported
-from evaluation import evaluate_model, run_multi_scenario_evaluation
+from evaluation import evaluate_model, multi_step_prediction, plot_multi_step_prediction
 
-def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
-                        model_path=config.MODEL_BEST_PATH,
-                        data_path=config.VAL_DATA_FILE,
-                        limit_prediction_steps=None,
-                        scenarios_to_eval=config.SCENARIOS,
-                        ics_to_eval=config.INITIAL_CONDITIONS_SPECIFIC
-                        ):
+def evaluate_saved_model(model_info_path=config.MODEL_FINAL_PATH,
+                         model_path=config.MODEL_BEST_PATH,
+                         # data_path is less relevant now, as we regenerate eval segment
+                         # data_path=config.COMBINED_DATA_FILE,
+                         limit_prediction_steps=None,
+                         eval_duration=20.0 # Duration of the segment to generate for evaluation
+                         ):
     """
-    Loads the best saved model state and evaluates its performance using
-    multi-scenario multi-step prediction.
-    Uses parameters stored in model_info_path for instantiation.
-    If data_path (validation data file) is not found, it attempts to regenerate it.
+    Loads a saved model state and evaluates its multi-step prediction performance
+    on a newly generated random segment.
     """
     print(f"--- Starting Evaluation of Saved Model ---")
     print(f"--- Loading model state from: {model_path} ---")
@@ -42,75 +41,51 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
     else: device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    # --- Load Data (Try loading VAL_DATA_FILE, fallback to generation) ---
-    # ... (Data loading/generation logic remains the same) ...
-    df_eval = None
-    try:
-        print(f"Attempting to load evaluation context data from {data_path}...")
-        df_eval = pd.read_csv(data_path)
-        print(f"Successfully loaded evaluation context data, shape: {df_eval.shape}")
-    except FileNotFoundError:
-        print(f"Warning: Evaluation context data file '{data_path}' not found. Regenerating...")
-        gen_start_time = time.time(); val_dfs = []; total_val_points = 0
-        try:
-            pendulum = PendulumSystem(); print("Pendulum system initialized.")
-            for scenario_type in config.SCENARIOS:
-                for i, x0 in enumerate(config.INITIAL_CONDITIONS_SPECIFIC):
-                    df_val_single = generate_simulation_data(pendulum, t_span=config.T_SPAN_VAL, dt=config.DT, x0=x0, torque_type=scenario_type)
-                    if not df_val_single.empty: val_dfs.append(df_val_single); total_val_points += len(df_val_single)
-            if not val_dfs: raise RuntimeError("No validation data generated.")
-            df_eval = pd.concat(val_dfs, ignore_index=True); gen_time = time.time() - gen_start_time
-            print(f"Validation data regenerated ({total_val_points} points), took {gen_time:.2f}s")
-            try: df_eval.to_csv(data_path, index=False); print(f"Saved to {data_path}.")
-            except Exception as save_e: print(f"Warning: Could not save regenerated data: {save_e}")
-        except Exception as gen_e: print(f"Error during data generation: {gen_e}"); return
-    except Exception as load_e: print(f"Error loading data: {load_e}"); return
-    if df_eval is None or df_eval.empty: print("Error: DataFrame empty. Aborting."); return
-
-
-    # --- Load Model Info and Determine Parameters ---
-    # ... (Logic remains the same) ...
-    model_info = None; model_type_for_eval = config.MODEL_TYPE; loaded_params = {}
+    # --- Load Model Info (to determine type/params) ---
+    model_info = None
+    model_type_for_eval = config.MODEL_TYPE # Default
+    loaded_params = {}
     if os.path.exists(model_info_path):
         try:
             model_info = torch.load(model_info_path, map_location='cpu')
             model_type_for_eval = model_info.get('model_type', config.MODEL_TYPE)
             loaded_params['hidden_size'] = model_info.get('hidden_size'); loaded_params['num_layers'] = model_info.get('num_layers'); loaded_params['dense_units'] = model_info.get('dense_units'); loaded_params['dropout_rate'] = model_info.get('dropout_rate')
-            print(f"Loaded model info from {model_info_path}. Determined model type: {model_type_for_eval}")
-            print(f"  Loaded Params: { {k:v for k,v in loaded_params.items() if v is not None} }")
+            print(f"Loaded model info. Determined model type: {model_type_for_eval}")
+            print(f"  Loaded Params: { {k:v for k,v in loaded_params.items() if v is not None and v != 'unknown'} }")
         except Exception as e: print(f"Warning: Could not load model info file {model_info_path}. Error: {e}"); model_info = None
     else: print(f"Warning: Model info file {model_info_path} not found.")
 
-
     # --- Load Scalers ---
-    # ... (Logic remains the same, using config.TARGET_SCALER_PATH) ...
-    target_scaler_path_to_load = config.TARGET_SCALER_PATH
-    if model_type_for_eval.lower() != config.MODEL_TYPE.lower(): print(f"Warning: Model type for eval ('{model_type_for_eval}') differs from current config ('{config.MODEL_TYPE}'). Ensure scaler path '{target_scaler_path_to_load}' is correct.")
-    print(f"Attempting to load target scaler from: {target_scaler_path_to_load}")
+    # Scaler paths are now determined in config based on MODEL_TYPE and USE_SINCOS_THETA
     print("Loading scalers...")
     try:
-        if not os.path.exists(config.INPUT_SCALER_PATH) or not os.path.exists(target_scaler_path_to_load): raise FileNotFoundError(f"Scaler file(s) not found: {config.INPUT_SCALER_PATH}, {target_scaler_path_to_load}")
-        input_scaler = joblib.load(config.INPUT_SCALER_PATH); target_scaler = joblib.load(target_scaler_path_to_load)
-        print(f"Scalers loaded ({config.INPUT_SCALER_PATH}, {target_scaler_path_to_load}).")
+        if not os.path.exists(config.INPUT_SCALER_PATH) or not os.path.exists(config.TARGET_SCALER_PATH):
+             raise FileNotFoundError(f"Scaler file(s) not found: {config.INPUT_SCALER_PATH}, {config.TARGET_SCALER_PATH}")
+        input_scaler = joblib.load(config.INPUT_SCALER_PATH)
+        target_scaler = joblib.load(config.TARGET_SCALER_PATH)
+        print(f"Scalers loaded ({config.INPUT_SCALER_PATH}, {config.TARGET_SCALER_PATH}).")
         if not hasattr(input_scaler, 'scale_') and not hasattr(input_scaler, 'min_'): raise ValueError("Input scaler not fitted.")
         if not hasattr(target_scaler, 'scale_') and not hasattr(target_scaler, 'min_'): raise ValueError("Target scaler not fitted.")
     except Exception as e: print(f"Error loading scalers: {e}"); return
 
-
     # --- Instantiate Model using Loaded/Config Parameters ---
-    # ... (Logic remains the same, using get_final_param helper) ...
     model = None
     try:
-        input_size = input_scaler.n_features_in_; output_size = target_scaler.n_features_in_
+        input_size = input_scaler.n_features_in_
+        output_size = target_scaler.n_features_in_ # Per-step output size (2)
+
+        # Get default params from config for the determined model type
         current_config_params = config.get_current_model_params()
         eval_params_dict = current_config_params
         if model_type_for_eval.lower() != config.MODEL_TYPE.lower():
-             temp_eval_params = config.MODEL_PARAMS.get("defaults", {}).copy(); base_key = model_type_for_eval.lower().replace("delta", "pure", 1); specific_params = config.MODEL_PARAMS.get(base_key)
+             temp_eval_params = config.MODEL_PARAMS.get("defaults", {}).copy(); base_key = model_type_for_eval.lower().replace("delta", "pure", 1).replace("seq2seq","pure",1); specific_params = config.MODEL_PARAMS.get(base_key)
              if specific_params: temp_eval_params.update(specific_params)
              else: print(f"Warning: Params for loaded type '{model_type_for_eval}' not in config.")
              for key, value in config.MODEL_PARAMS.get("defaults", {}).items():
                  if key not in temp_eval_params: temp_eval_params[key] = value
              eval_params_dict = temp_eval_params
+
+        # Determine final parameters
         def get_final_param(key, loaded_val, config_dict_for_type, target_type):
             default_val = config_dict_for_type.get(key)
             if loaded_val is not None and not (isinstance(loaded_val, str) and loaded_val.lower() == 'unknown'):
@@ -118,70 +93,118 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
                 except (ValueError, TypeError): pass
             if default_val is not None: return target_type(default_val)
             else: raise ValueError(f"Cannot determine value for '{key}'")
+
         hidden_size = get_final_param('hidden_size', loaded_params.get('hidden_size'), eval_params_dict, int)
         num_layers = get_final_param('num_layers', loaded_params.get('num_layers'), eval_params_dict, int)
         dense_units = get_final_param('dense_units', loaded_params.get('dense_units'), eval_params_dict, int)
         dropout = get_final_param('dropout_rate', loaded_params.get('dropout_rate'), eval_params_dict, float)
         if num_layers < 1: num_layers = 1
+
+        # Instantiate the correct model class
         model_type_key = model_type_for_eval.lower()
-        if model_type_key.startswith("purelstm") or model_type_key.startswith("deltalstm"): model_class = PureLSTM
-        elif model_type_key.startswith("puregru") or model_type_key.startswith("deltagru"): model_class = PureGRU
+        if model_type_key.startswith("purelstm") or model_type_key.startswith("deltalstm") or model_type_key.startswith("seq2seqlstm"): model_class = PureLSTM
+        elif model_type_key.startswith("puregru") or model_type_key.startswith("deltagru") or model_type_key.startswith("seq2seqgru"): model_class = PureGRU
         else: raise ValueError(f"Unknown model type: {model_type_for_eval}")
+
         print(f"Instantiating {model_class.__name__} with: input={input_size}, hidden={hidden_size}, layers={num_layers}, output={output_size}, dense={dense_units}, dropout={dropout}")
         model = model_class(input_size, hidden_size, num_layers, output_size, dense_units, dropout)
         print("Model instantiated.")
+
+        # --- Load State Dictionary ---
         if not os.path.exists(model_path): raise FileNotFoundError(f"Model state file not found at {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device); model.eval()
         print(f"Successfully loaded model state from '{model_path}' to {device}")
+
     except Exception as e: print(f"Error during model setup: {e}"); return
 
-    # --- Perform Evaluation using the consolidated function ---
-    print("\n--- Calling Multi-Scenario Multi-Step Prediction Evaluation ---")
-    # VVVVVV REMOVE the hasattr check VVVVVV
+    # --- Perform Evaluation ---
+    print("\n--- Multi-Step Prediction Evaluation (on newly generated segment) ---")
+    eval_start_time = time.time()
+    predicted_states, true_states, physics_predictions = None, None, None # Initialize
     try:
-        # Directly call the imported function
-        evaluation_results = run_multi_scenario_evaluation(
-            model=model,
-            input_scaler=input_scaler,
-            target_scaler=target_scaler, # Pass the loaded target scaler
-            device=device,
-            model_type_name=f"{model_type_for_eval} (Loaded)", # Pass descriptive name
-            scenarios_to_eval=scenarios_to_eval,
-            ics_to_eval=ics_to_eval,
-            limit_prediction_steps=limit_prediction_steps,
-            save_dir=config.FIGURES_DIR
-        )
-    except NameError:
-         # This might happen if evaluation.py itself has an import error for the function
-         print("Error: Function 'run_multi_scenario_evaluation' is not defined. Check imports in evaluation.py and here.")
-         evaluation_results = {}
-    except Exception as e:
-         print(f"Error calling run_multi_scenario_evaluation: {e}")
-         import traceback
-         traceback.print_exc() # Print full traceback for debugging
-         evaluation_results = {}
-    # ^^^^^^ MODIFIED BLOCK ^^^^^^
+        # Generate a short segment with random IC and random torque for evaluation
+        pendulum = PendulumSystem() # Initialize pendulum
+        eval_x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]
+        print(f"Generating evaluation segment: duration={eval_duration}s, IC={np.round(eval_x0, 2)}, torque={config.TORQUE_TYPE}")
+        df_eval_segment = generate_simulation_data(pendulum, t_span=(0, eval_duration), dt=config.DT, x0=eval_x0, torque_type=config.TORQUE_TYPE)
 
-    # --- Final Timing ---
-    eval_total_time = time.time() - eval_overall_start_time
-    print(f"\nOverall evaluation script finished in {eval_total_time:.2f} seconds.")
+        if not df_eval_segment.empty and len(df_eval_segment) > config.INPUT_SEQ_LEN + config.OUTPUT_SEQ_LEN:
+            eval_data_values = df_eval_segment[['theta', 'theta_dot', 'tau']].values
+            # Create sequences (absolute states for X) using the correct input/output lengths
+            X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN,
+                                         predict_delta=False, use_sincos=config.USE_SINCOS_THETA)
+
+            if len(X_eval) > 0:
+                X_eval_reshaped = X_eval.reshape(-1, X_eval.shape[2])
+                X_eval_scaled = input_scaler.transform(X_eval_reshaped).reshape(X_eval.shape)
+
+                initial_sequence_eval = X_eval_scaled[0]
+                # df_for_pred starts after the initial sequence used
+                df_for_pred_eval = df_eval_segment.iloc[config.INPUT_SEQ_LEN:].reset_index(drop=True)
+                available_steps = len(df_for_pred_eval)
+                prediction_steps_eval = available_steps
+                if limit_prediction_steps is not None and limit_prediction_steps > 0:
+                    prediction_steps_eval = min(prediction_steps_eval, limit_prediction_steps)
+
+                if prediction_steps_eval >= config.MIN_PREDICTION_STEPS:
+                     predicted_states, true_states = multi_step_prediction(
+                         model, initial_sequence_eval, df_for_pred_eval,
+                         input_seq_len=config.INPUT_SEQ_LEN, output_seq_len=config.OUTPUT_SEQ_LEN,
+                         prediction_steps=prediction_steps_eval,
+                         input_scaler=input_scaler, target_scaler=target_scaler, device=device
+                     )
+
+                     # Generate physics comparison for this segment
+                     if len(predicted_states) > 0:
+                           physics_x0 = df_eval_segment.iloc[config.INPUT_SEQ_LEN][['theta', 'theta_dot']].values
+                           physics_time_eval = df_for_pred_eval['time'].iloc[:prediction_steps_eval].values
+                           if len(physics_time_eval) > 0:
+                                physics_t_span = (physics_time_eval[0], physics_time_eval[-1])
+                                physics_tau_values = df_for_pred_eval['tau'].iloc[:prediction_steps_eval].values
+                                physics_dt = config.DT
+                                physics_time, physics_theta, physics_theta_dot = run_simulation(pendulum, physics_t_span, physics_dt, physics_x0, physics_tau_values, t_eval=physics_time_eval)
+                                if len(physics_time) == len(physics_time_eval): physics_predictions = np.stack([physics_theta, physics_theta_dot], axis=1)
+                           # Plot
+                           plot_multi_step_prediction(physics_time_eval, true_states, predicted_states, physics_predictions, f"{model_type_for_eval}_EvalSegment", config.FIGURES_DIR, filename_base=f"multistep_eval_{model_type_for_eval}")
+                           print(f"Multi-step prediction plot (Evaluation Segment) saved to {config.FIGURES_DIR}")
+                else: print(f"评估段可用步数 ({prediction_steps_eval}) 不足。")
+            else: print("无法为评估段创建序列。")
+        else: print("无法生成用于多步预测评估的数据段。")
+    except Exception as eval_msp_e: print(f"执行多步预测评估时出错: {eval_msp_e}"); import traceback; traceback.print_exc()
+
+    eval_time = time.time() - eval_start_time
+    print(f"\nEvaluation finished in {eval_time:.2f} seconds.")
+    print(f"Overall script time: {time.time() - eval_overall_start_time:.2f} seconds.")
 
 
 if __name__ == "__main__":
     utils.setup_logging_and_warnings(); utils.setup_chinese_font()
     # --- Configuration for Evaluation ---
-    start_index = 0; limit_steps = 1000
-    scenarios_to_run = config.SCENARIOS; ics_to_run = config.INITIAL_CONDITIONS_SPECIFIC
+    limit_steps = 1000 # Limit prediction length for speed
+
+    # Specify which trained model to evaluate by setting its type from config
     evaluate_model_type = config.MODEL_TYPE
+
+    # Construct paths based on the chosen model type
     eval_model_basename = f'pendulum_{evaluate_model_type.lower()}'
+    if config.USE_SINCOS_THETA: eval_model_basename += "_sincos" # Add sincos if used
     eval_model_info_path = os.path.join(config.MODELS_DIR, f'{eval_model_basename}_final.pth')
     eval_model_path = os.path.join(config.MODELS_DIR, f'{eval_model_basename}_best.pth')
-    eval_data_path = config.VAL_DATA_FILE
-    # ... (Print config) ...
-    print(f"--- Evaluating Model Type: {evaluate_model_type} ---") # ... etc
+    # Data path is less critical now, but keep for potential fallback logic if needed
+    eval_data_path = config.COMBINED_DATA_FILE # Point to combined file path (though not directly used for eval data)
+
+    print(f"--- Evaluating Model Type: {evaluate_model_type} ---")
+    print(f"Using Best Model State: {eval_model_path}")
+    print(f"Using Final Model Info: {eval_model_info_path}")
+    # print(f"Base Data File (for context/fallback): {eval_data_path}")
+    print(f"Prediction Step Limit: {limit_steps if limit_steps else 'None'}")
+
     evaluate_best_model(
-        model_info_path=eval_model_info_path, model_path=eval_model_path, data_path=eval_data_path,
-        limit_prediction_steps=limit_steps, scenarios_to_eval=scenarios_to_run, ics_to_eval=ics_to_run
+        model_info_path=eval_model_info_path,
+        model_path=eval_model_path,
+        data_path=eval_data_path, # Pass path, even if unused directly
+        limit_prediction_steps=limit_steps
+        # scenarios_to_eval and ics_to_eval removed as we generate one random segment
     )
 

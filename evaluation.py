@@ -6,22 +6,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import time
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from collections import defaultdict # For collecting results
+from sklearn.preprocessing import StandardScaler, MinMaxScaler # Keep imports
 
 # Import project modules
 import config
 import utils
-# Import necessary functions from other modules
-from data_generation import PendulumSystem, generate_simulation_data, run_simulation
-from data_preprocessing import create_sequences
+# Import necessary functions if physics comparison is added back later
+# from data_generation import PendulumSystem, run_simulation
 
 
 # --- Plotting Training Curves (remains the same) ---
 def plot_training_curves(train_losses, val_losses, save_dir=config.FIGURES_DIR):
-    # ... (implementation remains the same) ...
+    """绘制并保存训练和验证损失曲线。"""
     if not train_losses or not isinstance(train_losses, list) or \
-       not val_losses or not isinstance(val_losses, list): print("Warning: Invalid loss lists."); return
+       not val_losses or not isinstance(val_losses, list): print("警告: 损失列表无效或为空。"); return
     try:
         plt.figure(figsize=(10, 6)); epochs = range(1, len(train_losses) + 1)
         plt.plot(epochs, train_losses, label=utils.safe_text('训练损失', 'Training Loss'))
@@ -31,7 +29,7 @@ def plot_training_curves(train_losses, val_losses, save_dir=config.FIGURES_DIR):
         plt.title(utils.safe_text('模型训练过程中的损失', 'Model Loss During Training')); plt.xlabel(utils.safe_text('周期', 'Epoch')); plt.ylabel(utils.safe_text('均方误差 (MSE)', 'Mean Squared Error (MSE)'))
         plt.legend(); plt.grid(True)
         valid_train_losses = [l for l in train_losses if l is not None and np.isfinite(l) and l > 1e-9]
-        if valid_train_losses and len(valid_train_losses) > 1 and (max(valid_train_losses) / max(1e-9, min(valid_train_losses))) > 100: plt.yscale('log'); print("Info: Using log scale for y-axis in training curves plot.")
+        if valid_train_losses and len(valid_train_losses) > 1 and (max(valid_train_losses) / max(1e-9, min(valid_train_losses))) > 100: plt.yscale('log'); print("信息: 训练曲线使用对数 Y 轴。")
         os.makedirs(save_dir, exist_ok=True); save_path = os.path.join(save_dir, 'training_curves.png')
         plt.savefig(save_path, dpi=300); plt.close()
         print(f"训练曲线图已保存到: {save_path}")
@@ -39,85 +37,166 @@ def plot_training_curves(train_losses, val_losses, save_dir=config.FIGURES_DIR):
 
 
 # --- Evaluating Single-Step Loss (remains the same) ---
+# Note: Criterion now compares sequences (Batch, K, Features)
 def evaluate_model(model, data_loader, criterion, device=None):
-    # ... (implementation remains the same) ...
+    """在给定的数据加载器上评估模型并返回平均损失。"""
     if device is None:
         if torch.backends.mps.is_available(): device = torch.device("mps")
         elif torch.cuda.is_available(): device = torch.device("cuda")
         else: device = torch.device("cpu")
     model.to(device); model.eval(); total_loss = 0.0; batches = 0; start_time = time.time()
-    if data_loader is None: print("Warning: data_loader is None in evaluate_model."); return float('inf')
+    if data_loader is None: print("警告: evaluate_model 中的 data_loader 为 None。"); return float('inf')
     try: loader_len = len(data_loader.dataset) if hasattr(data_loader, 'dataset') else len(data_loader);
-    except (TypeError, AttributeError): loader_len = 0 # Assume non-zero if length unknown
-    if loader_len == 0 and hasattr(data_loader, 'dataset'): print("Warning: Evaluation dataset is empty."); return float('inf') # Check dataset length if possible
+    except (TypeError, AttributeError): loader_len = 0
+    if loader_len == 0 and hasattr(data_loader, 'dataset'): print("警告: 评估数据集为空。"); return float('inf')
     with torch.no_grad():
-        for inputs, targets in data_loader:
+        for inputs, targets in data_loader: # targets shape: (batch, K, output_size)
             inputs, targets = inputs.to(device), targets.to(device)
-            try: outputs = model(inputs); loss = criterion(outputs, targets)
-            except Exception as e: print(f"Error during model evaluation forward pass: {e}"); return float('inf')
-            if not torch.isfinite(loss): print("Warning: NaN or Inf loss detected."); return float('inf')
+            try: outputs = model(inputs) # outputs shape: (batch, K, output_size)
+            except Exception as e: print(f"评估模型前向传播错误: {e}"); return float('inf')
+            loss = criterion(outputs, targets) # MSELoss 计算所有元素的均方误差
+            if not torch.isfinite(loss): print("警告: 评估时损失为 NaN/Inf。"); return float('inf')
             total_loss += loss.item(); batches += 1
     avg_loss = total_loss / batches if batches > 0 else float('inf'); eval_time = time.time() - start_time
-    if np.isfinite(avg_loss): print(f'Average Validation/Test Loss (MSE): {avg_loss:.6f}, Evaluation Time: {eval_time:.2f}s')
-    else: print(f'Evaluation resulted in invalid average loss. Time: {eval_time:.2f}s')
+    if np.isfinite(avg_loss): print(f'平均验证/测试损失 (MSE): {avg_loss:.6f}, 评估耗时: {eval_time:.2f}s')
+    else: print(f'评估得到无效的平均损失。耗时: {eval_time:.2f}s')
     return avg_loss
 
 
-# --- Multi-Step Prediction (Handles Delta Prediction - remains the same) ---
-def multi_step_prediction(model, initial_sequence, df_pred, sequence_length, prediction_steps,
-                         input_scaler, target_scaler, device=None):
-    # ... (implementation remains the same as previous version) ...
-    # ... (returns predicted_states_original, true_states_original) ...
+# --- Multi-Step Prediction MODIFIED for Seq2Seq ---
+def multi_step_prediction(model, initial_sequence, df_pred,
+                          input_seq_len=config.INPUT_SEQ_LEN, # Use N from config
+                          output_seq_len=config.OUTPUT_SEQ_LEN, # Use K from config
+                          prediction_steps=None, # Total steps to generate
+                          input_scaler=None, target_scaler=None, device=None):
+    """
+    使用训练好的 Seq2Seq 模型执行多步预测。
+    每次预测 K 步，使用预测的第一步来前滚输入序列。
+
+    Args:
+        model (nn.Module): 训练好的 Seq2Seq 模型。
+        initial_sequence (np.array): 起始的输入序列 (已缩放), shape (input_seq_len, features)。
+        df_pred (pd.DataFrame): 包含未来真实值的 DataFrame (至少需要 tau, time, theta, theta_dot)
+                                覆盖预测范围，索引应与预测步对齐。
+        input_seq_len (int): 输入序列长度 (N)。
+        output_seq_len (int): 模型输出序列的长度 (K)。
+        prediction_steps (int): 要生成的总未来步数。如果为 None, 则预测 df_pred 的长度。
+        input_scaler: 拟合好的输入缩放器。
+        target_scaler: 拟合好的目标缩放器 (预测绝对状态)。
+        device: Torch 设备。
+
+    Returns:
+        tuple: (predicted_states_original, true_states_original)
+               predicted_states_original shape: (prediction_steps, output_size)
+               true_states_original shape: (prediction_steps, output_size)
+               如果预测失败则返回空数组。
+    """
     if device is None:
         if torch.backends.mps.is_available(): device = torch.device("mps")
         elif torch.cuda.is_available(): device = torch.device("cuda")
         else: device = torch.device("cpu")
     model.to(device); model.eval()
-    num_output_features = 2
-    if not isinstance(initial_sequence, np.ndarray) or initial_sequence.ndim != 2 or initial_sequence.shape[0] != sequence_length: return np.empty((0, num_output_features)), np.empty((0, num_output_features))
-    if df_pred.empty or len(df_pred) < prediction_steps: prediction_steps = len(df_pred)
-    if prediction_steps <= 0: return np.empty((0, num_output_features)), np.empty((0, num_output_features))
-    if not hasattr(input_scaler, 'scale_') or not hasattr(target_scaler, 'scale_'): return np.empty((0, num_output_features)), np.empty((0, num_output_features))
-    is_delta_prediction = isinstance(target_scaler, StandardScaler)
-    current_sequence_np = initial_sequence.copy(); predicted_states_list = []
+
+    # --- 输入验证 ---
+    num_output_features = 2 # theta, dot
+    if not isinstance(initial_sequence, np.ndarray) or initial_sequence.ndim != 2 or initial_sequence.shape[0] != input_seq_len:
+         print(f"错误: 初始序列形状无效。期望 ({input_seq_len}, features), 得到 {initial_sequence.shape}")
+         return np.empty((0, num_output_features)), np.empty((0, num_output_features))
+    if prediction_steps is None: prediction_steps = len(df_pred)
+    if df_pred.empty or len(df_pred) < prediction_steps:
+         print(f"警告: df_pred 为空或短于请求步数 ({prediction_steps})。调整步数。")
+         prediction_steps = len(df_pred)
+    if prediction_steps <= 0: print("错误: 没有可预测的步数。"); return np.empty((0, num_output_features)), np.empty((0, num_output_features))
+    if not hasattr(input_scaler, 'scale_') or not hasattr(target_scaler, 'scale_'): print("错误: 输入或目标缩放器未拟合。"); return np.empty((0, num_output_features)), np.empty((0, num_output_features))
+    # 确认目标缩放器类型 (Seq2Seq 预测绝对状态)
+    if not isinstance(target_scaler, MinMaxScaler) and not isinstance(target_scaler, StandardScaler):
+         print(f"警告: 目标缩放器类型未知 ({type(target_scaler)}), 假设预测绝对状态。")
+    is_delta_prediction = False # Seq2Seq 当前设置为预测绝对状态
+
+    current_sequence_np = initial_sequence.copy() # 缩放后的输入序列 [t-N+1, ..., t]
+    predicted_states_list = [] # 存储 *反标准化后* 的预测状态 [t+1, t+2, ...]
     num_input_features = input_scaler.n_features_in_
-    last_unscaled_state = np.zeros(num_output_features); first_step_in_delta = True
+
+    print(f"运行 Seq2Seq 多步预测，共 {prediction_steps} 步...")
     with torch.no_grad():
         for i in range(prediction_steps):
-            current_sequence_tensor = torch.tensor(current_sequence_np.reshape(1, sequence_length, num_input_features), dtype=torch.float32).to(device)
-            try: model_output_scaled = model(current_sequence_tensor).cpu().numpy()[0];
-            except Exception as e: print(f"Error forward pass step {i}: {e}"); break
-            if not np.all(np.isfinite(model_output_scaled)): print(f"NaN/Inf detected step {i}."); break
+            current_sequence_tensor = torch.tensor(
+                current_sequence_np.reshape(1, input_seq_len, num_input_features),
+                dtype=torch.float32
+            ).to(device)
+
+            # --- 预测 (模型输出 K 步) ---
             try:
-                model_output_unscaled = target_scaler.inverse_transform(model_output_scaled.reshape(1, -1))[0]
-                if is_delta_prediction:
-                    if first_step_in_delta: current_state_unscaled = df_pred.iloc[0][['theta', 'theta_dot']].values; first_step_in_delta = False
-                    else: current_state_unscaled = last_unscaled_state + model_output_unscaled
-                    predicted_states_list.append(current_state_unscaled); last_unscaled_state = current_state_unscaled.copy()
-                else: current_state_unscaled = model_output_unscaled; predicted_states_list.append(current_state_unscaled)
-            except Exception as e: print(f"Error reconstruction step {i}: {e}"); break
+                # model_output_scaled shape: (1, K, output_size)
+                model_output_scaled_sequence = model(current_sequence_tensor).cpu().numpy()[0]
+                if not np.all(np.isfinite(model_output_scaled_sequence)): print(f"NaN/Inf detected at step {i}. Stopping."); break
+
+                # 我们只用预测的 K 步中的第一步来前滚
+                next_step_output_scaled = model_output_scaled_sequence[0, :] # Shape: (output_size,)
+
+            except Exception as e: print(f"模型前向传播错误 step {i}: {e}"); break
+
+            # --- 状态更新 (反标准化预测的第一步) ---
             try:
+                # 反标准化预测的 state(t+1)
+                current_state_unscaled = target_scaler.inverse_transform(next_step_output_scaled.reshape(1, -1))[0]
+                predicted_states_list.append(current_state_unscaled) # 存储预测的 state(t+1)
+
+            except Exception as e: print(f"状态反标准化错误 step {i}: {e}"); break
+
+            # --- 准备下一步的输入 ---
+            # 使用预测出的 state(t+1) 和已知的 tau(t+1) 来构建输入序列的最后一步
+            try:
+                # 需要 t+1 时刻的 tau (在 df_pred 的索引 i 处)
                 next_tau_original = df_pred.iloc[i]['tau']
-                next_input_features_unscaled = np.zeros(num_input_features)
-                next_input_features_unscaled[0:num_output_features] = current_state_unscaled
-                if num_input_features > num_output_features: next_input_features_unscaled[-1] = next_tau_original
+
+                # 处理 sin/cos 特征 (如果启用)
+                pred_theta, pred_theta_dot = current_state_unscaled[0], current_state_unscaled[1]
+                if config.USE_SINCOS_THETA:
+                     next_input_features_unscaled = np.array([np.sin(pred_theta), np.cos(pred_theta), pred_theta_dot, next_tau_original])
+                else:
+                     next_input_features_unscaled = np.array([pred_theta, pred_theta_dot, next_tau_original])
+
+                # 标准化这个新的特征向量
                 next_step_features_scaled = input_scaler.transform(next_input_features_unscaled.reshape(1, -1))[0]
-            except IndexError: break # End of df_pred
-            except Exception as e: print(f"Error preparing next input step {i}: {e}"); break
+
+            except IndexError: print(f"警告: 在 df_pred 中找不到 tau 输入 step {i}. 停止。"); break
+            except Exception as e: print(f"准备下一步输入时出错 step {i}: {e}"); break
+
+            # 更新序列: 去掉最旧的一步, 加入最新的一步
             current_sequence_np = np.append(current_sequence_np[1:], next_step_features_scaled.reshape(1, -1), axis=0)
+            # 循环结束
+
+    # --- 处理结果 ---
     actual_prediction_steps = len(predicted_states_list)
     if actual_prediction_steps == 0: return np.empty((0, num_output_features)), np.empty((0, num_output_features))
+
     predicted_states_original = np.array(predicted_states_list)
+    # 获取对应的真实状态 (从 t+1 到 t+actual_steps)
     true_states_original = df_pred.iloc[:actual_prediction_steps][['theta', 'theta_dot']].values
-    if len(predicted_states_original) != len(true_states_original): min_len = min(len(predicted_states_original), len(true_states_original)); predicted_states_original = predicted_states_original[:min_len]; true_states_original = true_states_original[:min_len]
+
+    # 最终长度检查
+    if len(predicted_states_original) != len(true_states_original):
+        min_len = min(len(predicted_states_original), len(true_states_original))
+        predicted_states_original = predicted_states_original[:min_len]
+        true_states_original = true_states_original[:min_len]
+
+    if len(predicted_states_original) > 0:
+        mse = np.mean((predicted_states_original - true_states_original)**2)
+        print(f"多步预测 MSE ({actual_prediction_steps} 步): {mse:.6f}")
+    else: print("无法计算多步预测 MSE。")
+
     return predicted_states_original, true_states_original
 
 
-# --- Plotting Multi-Step Prediction (remains the same) ---
+# --- Plotting Multi-Step Prediction (remains the same, plots one case) ---
 def plot_multi_step_prediction(time_vector, true_states, predicted_states,
                                physics_model_predictions=None, model_name="LSTM",
                                save_dir=config.FIGURES_DIR, filename_base="multi_step_prediction"):
-    # ... (implementation remains the same as previous version) ...
+    """
+    绘制多步预测与真实轨迹的比较。
+    """
+    # ... (绘图函数的实现保持不变，它绘制传入的 time, true, predicted 数据) ...
     if not all(isinstance(arr, np.ndarray) for arr in [time_vector, true_states, predicted_states]) or \
        len(predicted_states) == 0 or len(true_states) == 0 or len(time_vector) == 0: print(f"Warning: Empty data for plotting '{filename_base}'."); return
     min_len = len(predicted_states); # ... (length adjustment logic) ...
@@ -163,164 +242,9 @@ def plot_multi_step_prediction(time_vector, true_states, predicted_states,
     except Exception as e: print(f"Error plotting multi-step prediction for '{filename_base}': {e}"); import traceback; traceback.print_exc(); plt.close()
 
 
-# --- Internal Grid Plotting Function (remains the same) ---
-def _plot_grid_internal(results_data, scenarios, ics, model_type_name, results_summary, save_dir,
-                        variable_index, variable_label, variable_unit, plot_filename):
-    # ... (implementation remains the same) ...
-    num_rows = len(scenarios); num_cols = len(ics);
-    if num_rows == 0 or num_cols == 0: print("Warning: No scenarios or ICs to plot."); return
-    print(f"\nGenerating {num_rows}x{num_cols} grid plot for {variable_label}...")
-    figsize_width = max(15, num_cols * 3); figsize_height = max(12, num_rows * 2.5)
-    fig, axes = plt.subplots(num_rows, num_cols, figsize=(figsize_width, figsize_height), sharex=True, sharey=True)
-    if num_rows == 1 and num_cols == 1: axes = np.array([[axes]])
-    elif num_rows == 1: axes = axes.reshape(1, -1)
-    elif num_cols == 1: axes = axes.reshape(-1, 1)
-    main_title = utils.safe_text(f'多场景多步预测 ({model_type_name}): {variable_label}', f'Multi-Scenario Multi-Step Prediction ({model_type_name}): {variable_label}')
-    fig.suptitle(main_title, fontsize=16, fontweight='bold')
-    for r, scenario_name in enumerate(scenarios):
-        for c in range(num_cols):
-            ax = axes[r, c]; run_id = f"{scenario_name}_ic{c+1}"; data = results_data.get(run_id)
-            if data and data.get('time') is not None and len(data['time']) > 0:
-                time_vector = data['time']; true_val = data['true'][:, variable_index] if data['true'].ndim > 1 and data['true'].shape[1] > variable_index else np.full_like(time_vector, np.nan); pred_val = data['pred'][:, variable_index] if data['pred'].ndim > 1 and data['pred'].shape[1] > variable_index else np.full_like(time_vector, np.nan); physics_val = data.get('physics')
-                ax.plot(time_vector, true_val, 'g-', label=utils.safe_text('真实', 'True'), linewidth=1.5, alpha=0.8); ax.plot(time_vector, pred_val, 'r--', label=utils.safe_text('预测', 'Pred'), linewidth=1.5);
-                if physics_val is not None and len(physics_val) == len(time_vector) and physics_val.ndim > 1 and physics_val.shape[1] > variable_index : ax.plot(time_vector, physics_val[:, variable_index], 'b-.', label=utils.safe_text('物理', 'Phys'), linewidth=1, alpha=0.6)
-                mse_val = results_summary.get(run_id, {}).get('mse', np.nan); mse_str = f"MSE: {mse_val:.3f}" if np.isfinite(mse_val) else "MSE: N/A"; ax.set_title(utils.safe_text(f'{scenario_name} / IC {c+1}\n{mse_str}', f'{scenario_name}/IC{c+1}\n{mse_str}'), fontsize=9)
-            else: ax.text(0.5, 0.5, 'N/A', ha='center', va='center', transform=ax.transAxes); ax.set_title(utils.safe_text(f'{scenario_name} / IC {c+1}\n(No Data)', f'{scenario_name}/IC{c+1}\n(No Data)'), fontsize=9)
-            ax.grid(True);
-            if r == num_rows - 1: ax.set_xlabel(utils.safe_text('时间 (s)', 'Time (s)'), fontsize=9)
-            if c == 0: ax.set_ylabel(f"{variable_label} ({variable_unit})", fontsize=9)
-            ax.tick_params(axis='both', which='major', labelsize=8)
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    if handles: fig.legend(handles, labels, loc='upper right', fontsize=10)
-    plt.tight_layout(rect=[0.03, 0.03, 0.97, 0.93]); os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, plot_filename)
-    try: plt.savefig(save_path, dpi=200); plt.close(); print(f"Multi-scenario grid plot saved to: {save_path}")
-    except Exception as e: print(f"Error saving grid plot '{plot_filename}': {e}"); plt.close()
-
-
-# --- Wrapper function for Angle Grid Plot (remains the same) ---
-def plot_multi_scenario_grid_angle(results_data, scenarios, ics, model_type_name, results_summary, save_dir=config.FIGURES_DIR):
-    grid_filename = f'multistep_grid_angle_{model_type_name.replace(" ", "_").replace("(", "").replace(")", "")}.png'
-    _plot_grid_internal(results_data, scenarios, ics, model_type_name, results_summary, save_dir, variable_index=0, variable_label=utils.safe_text('角度 θ', 'Angle θ'), variable_unit='rad', plot_filename=grid_filename)
-
-# --- Wrapper function for Velocity Grid Plot (remains the same) ---
-def plot_multi_scenario_grid_velocity(results_data, scenarios, ics, model_type_name, results_summary, save_dir=config.FIGURES_DIR):
-    grid_filename = f'multistep_grid_velocity_{model_type_name.replace(" ", "_").replace("(", "").replace(")", "")}.png'
-    _plot_grid_internal(results_data, scenarios, ics, model_type_name, results_summary, save_dir, variable_index=1, variable_label=utils.safe_text('角速度 θ̇', 'Angular Velocity θ̇'), variable_unit='rad/s', plot_filename=grid_filename)
-
-
-# --- Consolidated Evaluation Function - MODIFIED ---
-# Now calls the grid plotting functions at the end
-def run_multi_scenario_evaluation(model, input_scaler, target_scaler, device,
-                                  model_type_name, # Pass model type name for plotting labels
-                                  scenarios_to_eval=config.SCENARIOS,
-                                  ics_to_eval=config.INITIAL_CONDITIONS_SPECIFIC,
-                                  limit_prediction_steps=None,
-                                  save_dir=config.FIGURES_DIR):
-    """
-    Runs multi-step prediction evaluation for multiple scenarios and initial conditions.
-    Generates data segments on-the-fly, collects results, and plots separate grids for angle and velocity.
-    """
-    eval_start_time = time.time()
-    # Store detailed results for grid plotting
-    results_data = defaultdict(dict)
-    # Store summary results (MSE, steps)
-    results_summary = defaultdict(lambda: {'mse': np.nan, 'steps': 0})
-
-    print("\n--- Performing Multi-Scenario Multi-Step Prediction Evaluation ---")
-    try: pendulum = PendulumSystem(m=config.PENDULUM_MASS, L=config.PENDULUM_LENGTH, g=config.GRAVITY, c=config.DAMPING_COEFF)
-    except Exception as e: print(f"Error initializing PendulumSystem: {e}"); return results_summary
-
-    model.eval(); model.to(device)
-
-    for scenario_idx, scenario_type in enumerate(scenarios_to_eval):
-        for ic_idx, x0 in enumerate(ics_to_eval):
-            run_id = f"{scenario_type}_ic{ic_idx+1}"
-            print(f"\nEvaluating Scenario: '{scenario_type}', Initial Condition {ic_idx+1}: {x0} ({run_id})")
-
-            # 1. Generate data segment
-            df_eval_segment = generate_simulation_data(pendulum, t_span=config.T_SPAN_VAL, dt=config.DT, x0=x0, torque_type=scenario_type)
-            if df_eval_segment.empty or len(df_eval_segment) <= config.SEQUENCE_LENGTH: print(f"  Warning: Not enough data generated for {run_id}. Skipping."); continue
-
-            # 2. Prepare sequences
-            eval_data_values = df_eval_segment[['theta', 'theta_dot', 'tau']].values
-            X_eval_segment, _ = create_sequences(eval_data_values, config.SEQUENCE_LENGTH, predict_delta=False)
-            if len(X_eval_segment) == 0: print(f"  Warning: No sequences created for {run_id}. Skipping."); continue
-
-            # 3. Scale sequences
-            try: X_eval_scaled = input_scaler.transform(X_eval_segment.reshape(-1, X_eval_segment.shape[2])).reshape(X_eval_segment.shape)
-            except Exception as e: print(f"  Error scaling sequences for {run_id}: {e}. Skipping."); continue
-
-            initial_sequence = X_eval_scaled[0]
-            df_for_pred_segment = df_eval_segment.iloc[config.SEQUENCE_LENGTH:].reset_index(drop=True)
-            available_steps = len(df_for_pred_segment)
-            prediction_steps = available_steps
-            if limit_prediction_steps is not None and limit_prediction_steps > 0: prediction_steps = min(prediction_steps, limit_prediction_steps)
-            if prediction_steps < config.MIN_PREDICTION_STEPS: print(f"  Warning: Insufficient steps ({prediction_steps}) for {run_id}. Skipping."); continue
-
-            # 4. Run Multi-Step Prediction
-            predicted_states, true_states = multi_step_prediction(model, initial_sequence, df_for_pred_segment, config.SEQUENCE_LENGTH, prediction_steps, input_scaler, target_scaler, device)
-
-            # 5. Store results and calculate MSE
-            if len(predicted_states) > 0 and len(true_states) == len(predicted_states):
-                run_mse = np.mean((predicted_states - true_states)**2)
-                results_summary[run_id]['mse'] = run_mse
-                results_summary[run_id]['steps'] = len(predicted_states)
-                print(f"  Multi-step MSE for {run_id} ({results_summary[run_id]['steps']} steps): {run_mse:.6f}")
-
-                # 6. Generate Physics Comparison
-                physics_predictions = None
-                try:
-                    physics_x0 = df_eval_segment.iloc[config.SEQUENCE_LENGTH][['theta', 'theta_dot']].values
-                    physics_time_eval = df_for_pred_segment['time'].iloc[:prediction_steps].values
-                    if len(physics_time_eval) > 0:
-                         physics_t_span = (physics_time_eval[0], physics_time_eval[-1])
-                         physics_tau_values = df_for_pred_segment['tau'].iloc[:prediction_steps].values
-                         physics_dt = config.DT
-                         physics_time, physics_theta, physics_theta_dot = run_simulation(pendulum, physics_t_span, physics_dt, physics_x0, physics_tau_values, t_eval=physics_time_eval)
-                         if len(physics_time) == len(physics_time_eval): physics_predictions = np.stack([physics_theta, physics_theta_dot], axis=1)
-                         else: print("  Warning: Physics sim length mismatch.")
-                    else: print("  Warning: Cannot run physics sim (no time points).")
-                except Exception as e: print(f"  Error generating physics comparison for {run_id}: {e}")
-
-                # 7. Store detailed data needed for the grid plot
-                results_data[run_id] = {
-                    'time': physics_time_eval if 'physics_time_eval' in locals() and len(physics_time_eval)>0 else np.array([]),
-                    'true': true_states,
-                    'pred': predicted_states,
-                    'physics': physics_predictions # Store physics results (can be None)
-                }
-            else: print(f"  Multi-step prediction failed for {run_id}.")
-            # End of IC loop
-        # End of Scenario loop
-
-    # --- Plotting Grids (After all loops complete) ---
-    if results_data: # Check if any results were collected
-        # Prepare IC list (needed by plotting function for column count)
-        # ics_to_eval was passed into this function
-        # Plot Angle Grid
-        plot_multi_scenario_grid_angle(results_data, scenarios_to_eval, ics_to_eval,
-                                       model_type_name, results_summary, save_dir)
-        # Plot Velocity Grid
-        plot_multi_scenario_grid_velocity(results_data, scenarios_to_eval, ics_to_eval,
-                                          model_type_name, results_summary, save_dir)
-    else:
-        print("No valid multi-step prediction results collected to generate grid plots.")
-
-
-    # --- Summary Print ---
-    print("\n--- Multi-Step Prediction MSE Summary ---")
-    valid_mses = []
-    for run_id, result in results_summary.items(): # Use summary dict
-        if np.isfinite(result['mse']):
-            print(f"  {run_id}: MSE = {result['mse']:.6f} ({result['steps']} steps)")
-            valid_mses.append(result['mse'])
-        else:
-            print(f"  {run_id}: Failed or not enough steps.")
-    if valid_mses: print(f"  Average MSE over successful runs: {np.mean(valid_mses):.6f}")
-    else: print("  No successful multi-step prediction runs to average.")
-
-    eval_total_time = time.time() - eval_start_time
-    print(f"\nMulti-scenario evaluation finished in {eval_total_time:.2f} seconds.")
-    return results_summary # Return the summary dictionary
+# --- Remove Consolidated Evaluation and Grid Plotting ---
+# def run_multi_scenario_evaluation(...): ...
+# def _plot_grid_internal(...): ...
+# def plot_multi_scenario_grid_angle(...): ...
+# def plot_multi_scenario_grid_velocity(...): ...
 
