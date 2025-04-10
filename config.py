@@ -2,7 +2,8 @@
 
 """
 Configuration settings for the Pendulum LSTM/GRU experiment.
-Using separate generation for Train and Validation sets.
+Using separate generation for Train/Validation sets.
+Configured for Delta Prediction with smaller model and StandardScaler for input.
 """
 
 import numpy as np
@@ -10,18 +11,38 @@ import os
 
 # --- Model Selection ---
 # Options: "PureLSTM", "PureGRU", "DeltaLSTM", "DeltaGRU"
-MODEL_TYPE = "DeltaGRU" # Keep DeltaGRU for now, can be changed
+MODEL_TYPE = "DeltaGRU" # <<<--- Keep DeltaGRU (or change to DeltaLSTM if preferred)
 
 # --- Model Architecture Parameters ---
-# Using dictionary structure
+# Use a dictionary to hold parameters specific to each model type
 MODEL_PARAMS = {
-    "defaults": { "dense_units": 64, "dropout_rate": 0.35 },
-    "purelstm": { "hidden_size": 96, "num_layers": 2 },
-    "puregru":  { "hidden_size": 96, "num_layers": 2 },
-    "deltalstm":{ "hidden_size": 96, "num_layers": 2 },
-    "deltagru": { "hidden_size": 96, "num_layers": 2 }
+    "defaults": {
+        # Reduce dense units for smaller model
+        "dense_units": 32, # Reduced from 64
+        "dropout_rate": 0.30 # Can slightly adjust dropout if needed
+    },
+    "purelstm": {
+        "hidden_size": 64, # Reduced from 96
+        "num_layers": 2,   # Keep 2 layers (or try 1)
+    },
+    "puregru": {
+        "hidden_size": 64, # Reduced from 96
+        "num_layers": 2,   # Keep 2 layers (or try 1)
+    },
+    # Delta models use the base architecture params
+    "deltalstm": {
+        "hidden_size": 64,
+        "num_layers": 2,
+    },
+    "deltagru": {
+        "hidden_size": 64,
+        "num_layers": 2,
+    }
 }
+
+# Function to easily get parameters (remains the same)
 def get_current_model_params():
+    """Gets the parameter dictionary for the currently selected MODEL_TYPE."""
     model_type_key = MODEL_TYPE.lower()
     params = MODEL_PARAMS.get("defaults", {}).copy()
     base_type_key = model_type_key.replace("delta", "pure", 1) if model_type_key.startswith("delta") else model_type_key
@@ -29,67 +50,60 @@ def get_current_model_params():
     if specific_params is None: raise ValueError(f"Params for '{MODEL_TYPE}'/'{base_type_key}' not found.")
     params.update(specific_params)
     print(f"Info: Using parameters from '{base_type_key}' definition for model '{MODEL_TYPE}'.")
+    # Manually add defaults if they weren't in the specific dict
+    for key, value in MODEL_PARAMS.get("defaults", {}).items():
+        if key not in params: params[key] = value
     return params
 
 # --- Training Hyperparameters ---
 NUM_EPOCHS = 150
-LEARNING_RATE = 0.0002
+LEARNING_RATE = 0.0002 # Keep lowered LR
 WEIGHT_DECAY = 1e-5
 BATCH_SIZE = 128
 EARLY_STOPPING_PATIENCE = 20
 SCHEDULER_FACTOR = 0.5
 SCHEDULER_PATIENCE = 8
 
-# --- Simulation Parameters ---
-PENDULUM_MASS = 1.0
-PENDULUM_LENGTH = 1.0
-GRAVITY = 9.81
-DAMPING_COEFF = 0.5
-DT = 0.02
-
-# Define specific Initial Conditions (ICs)
+# --- Simulation Parameters (remain the same) ---
+PENDULUM_MASS = 1.0; PENDULUM_LENGTH = 1.0; GRAVITY = 9.81; DAMPING_COEFF = 0.5
+DT = 0.02; T_SPAN_TRAIN = (0, 40); T_SPAN_VAL = (0, 10)
 INITIAL_CONDITIONS_SPECIFIC = [
-    [0.0, 0.0],         # 1. Static (or near static)
-    [0.3, -0.5],        # 2. Low Amplitude, Falling Right
-    [-0.3, 0.5],        # 3. Low Amplitude, Rising Left
-    [-1.0, -1.0],       # 4. High Amplitude, Falling Left
-    [1.0, 1.0]          # 5. High Amplitude, Rising Right
+    [0.0, 0.0], [0.3, -0.5], [-0.3, 0.5], [-1.0, -1.0], [1.0, 1.0]
 ]
-# Define Torque Scenarios
 SCENARIOS = ["zero", "step", "sine", "random", "mixed"]
 
-# Define different simulation durations for train and validation
-T_SPAN_TRAIN = (0, 40)  # Longer duration for training data (e.g., 40 seconds per segment)
-T_SPAN_VAL = (0, 10)    # Shorter duration for validation data (e.g., 10 seconds per segment)
-
 # --- Data Handling ---
-# Define separate file paths for train and validation data
 TRAIN_DATA_FILE = 'train_data_sep.csv'
 VAL_DATA_FILE = 'validation_data_sep.csv'
-# DATA_FILE_EXTENDED is no longer the primary source for training/validation split
-FORCE_REGENERATE_DATA = False # Still useful to control regeneration
+FORCE_REGENERATE_DATA = False
 MODELS_DIR = 'models'
 FIGURES_DIR = 'figures'
-PLOT_SCENARIO_DATA = True # Flag to plot individual generated scenarios
+PLOT_SCENARIO_DATA = True # Keep plotting scenarios enabled
 
 # --- Preprocessing Parameters ---
 SEQUENCE_LENGTH = 20
-# VALIDATION_SPLIT is no longer needed as we generate sets separately
 MIN_PREDICTION_STEPS = 50
+# Add Input Scaler Type configuration
+INPUT_SCALER_TYPE = "StandardScaler" # <<<--- CHANGE TO StandardScaler (options: "MinMaxScaler", "StandardScaler")
 
 # --- Paths ---
 MODEL_BASENAME = f'pendulum_{MODEL_TYPE.lower()}'
 MODEL_BEST_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_best.pth')
 MODEL_FINAL_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_final.pth')
 
-# Scaler paths and type determination remains the same
+# Target Scaler paths and type determination remains the same
 if MODEL_TYPE.lower().startswith("delta"):
     TARGET_SCALER_PATH = os.path.join(MODELS_DIR, 'delta_scaler.pkl')
     TARGET_SCALER_TYPE = "StandardScaler"
 else:
     TARGET_SCALER_PATH = os.path.join(MODELS_DIR, 'output_scaler.pkl')
     TARGET_SCALER_TYPE = "MinMaxScaler"
+print(f"Config: Set TARGET_SCALER_PATH to {TARGET_SCALER_PATH}")
+print(f"Config: Set TARGET_SCALER_TYPE to {TARGET_SCALER_TYPE}")
+
+# Input scaler path remains the same, but the type of scaler saved will change
 INPUT_SCALER_PATH = os.path.join(MODELS_DIR, 'input_scaler.pkl')
+print(f"Config: Set INPUT_SCALER_TYPE to {INPUT_SCALER_TYPE}")
 
 # --- Misc ---
 SEED = 42

@@ -13,22 +13,33 @@ import os
 import time
 import config # Import config
 
-# create_sequences remains the same as before (handles predict_delta)
+# Updated create_sequences to handle delta calculation based on argument
 def create_sequences(data, sequence_length, predict_delta=False):
     """
     Creates input sequences and corresponding target outputs (state or delta state).
+
+    Args:
+        data (np.array): Numpy array with columns [theta, theta_dot, tau].
+        sequence_length (int): The number of time steps for each input sequence.
+        predict_delta (bool): If True, target 'y' will be state difference y(t+1)-y(t).
+                              If False, target 'y' will be absolute state y(t+1).
+
+    Returns:
+        tuple: (X, y) where X is the array of input sequences and y is the array of targets.
+               X shape: (num_samples, sequence_length, num_features)
+               y shape: (num_samples, num_output_features)
     """
     X, y = [], []
     num_features = data.shape[1]
     output_size = 2 # Predicting theta, theta_dot or their deltas
     if num_features < 3: # Need at least theta, theta_dot, tau
-        print(f"Error: Data has only {num_features} features, expected at least 3.")
+        print(f"Error in create_sequences: Data has only {num_features} features, expected at least 3.")
         return np.empty((0, sequence_length, num_features)), np.empty((0, output_size))
 
     min_len_needed = sequence_length + 1
 
     if len(data) < min_len_needed:
-        print(f"Warning: Data length ({len(data)}) < {min_len_needed} needed. Cannot create sequences.")
+        # print(f"Warning in create_sequences: Data length ({len(data)}) < {min_len_needed} needed. Cannot create sequences.")
         return np.empty((0, sequence_length, num_features)), np.empty((0, output_size))
 
     for i in range(len(data) - sequence_length):
@@ -37,7 +48,6 @@ def create_sequences(data, sequence_length, predict_delta=False):
         if predict_delta:
             # Calculate delta: y(t+1) - y(t)
             if i + sequence_length -1 < 0 or i + sequence_length >= len(data): continue
-            # state at t is the last step of the input sequence
             current_state = input_seq[-1, 0:output_size]
             next_state = data[i + sequence_length, 0:output_size]
             target = next_state - current_state
@@ -57,7 +67,7 @@ def prepare_train_val_data_from_dfs(df_train, df_val, sequence_length=config.SEQ
     """
     Prepares training and validation DataLoaders from separately generated DataFrames.
     Handles sequence creation, shuffling, scaling (fit on train only), and DataLoader creation.
-    Determines target type (absolute/delta) and scaler type from config.
+    Determines target type (absolute/delta) and scaler types from config.
 
     Args:
         df_train (pd.DataFrame): DataFrame containing the training data.
@@ -74,13 +84,11 @@ def prepare_train_val_data_from_dfs(df_train, df_val, sequence_length=config.SEQ
 
     # --- Validate Input DataFrames ---
     if df_train is None or df_train.empty or not all(col in df_train.columns for col in required_cols):
-        print("Error: Training DataFrame is missing, empty, or lacks required columns.")
-        return (None,) * 4
+        print("Error: Training DataFrame is missing, empty, or lacks required columns."); return (None,) * 4
     if df_val is None or df_val.empty or not all(col in df_val.columns for col in required_cols):
-        print("Error: Validation DataFrame is missing, empty, or lacks required columns.")
-        # Might proceed without validation loader, but scalers need fitting on train data.
-        # Let's return None for now to indicate failure.
-        return (None,) * 4
+        print("Warning: Validation DataFrame is missing, empty, or lacks required columns. Proceeding without validation loader.")
+        # We can proceed to prepare training data, but val_loader will be None
+        df_val = pd.DataFrame(columns=required_cols) # Create empty df to avoid errors later
 
     # Determine if delta prediction is needed
     predict_delta = config.MODEL_TYPE.lower().startswith("delta")
@@ -93,12 +101,9 @@ def prepare_train_val_data_from_dfs(df_train, df_val, sequence_length=config.SEQ
     X_val, y_val = create_sequences(df_val[required_cols].values, sequence_length, predict_delta)
 
     if X_train.shape[0] == 0 or y_train.shape[0] == 0:
-        print("Error: No sequences created from training data.")
-        return (None,) * 4
-    # Validation set might be smaller or empty if T_SPAN_VAL was very short
+        print("Error: No sequences created from training data."); return (None,) * 4
     if X_val.shape[0] == 0 or y_val.shape[0] == 0:
         print("Warning: No sequences created from validation data. Validation loader will be None.")
-        # Set validation arrays to empty with correct dimensions
         X_val = np.empty((0, sequence_length, X_train.shape[2]))
         y_val = np.empty((0, y_train.shape[1]))
 
@@ -111,26 +116,36 @@ def prepare_train_val_data_from_dfs(df_train, df_val, sequence_length=config.SEQ
     print("Training data shuffled.")
 
     # --- Scaling ---
-    num_input_features = X_train.shape[2]
-    num_output_features = y_train.shape[1]
+    num_input_features = X_train.shape[2]; num_output_features = y_train.shape[1]
     X_train_reshaped = X_train.reshape(-1, num_input_features)
     X_val_reshaped = X_val.reshape(-1, num_input_features) if X_val.shape[0] > 0 else np.empty((0, num_input_features))
 
-    input_scaler = MinMaxScaler(feature_range=(-1, 1))
-    if config.TARGET_SCALER_TYPE == "StandardScaler": target_scaler = StandardScaler()
-    else: target_scaler = MinMaxScaler(feature_range=(-1, 1))
-    print(f"Using {config.TARGET_SCALER_TYPE} for target variable (y).")
+    # Initialize scalers based on config
+    if config.INPUT_SCALER_TYPE.lower() == "standardscaler":
+        input_scaler = StandardScaler()
+        print("Using StandardScaler for input features (X).")
+    else: # Default to MinMaxScaler
+        input_scaler = MinMaxScaler(feature_range=(-1, 1))
+        print("Using MinMaxScaler for input features (X).")
 
+    if config.TARGET_SCALER_TYPE == "StandardScaler":
+        target_scaler = StandardScaler()
+        print(f"Using StandardScaler for target variable (y - {'delta' if predict_delta else 'state'}).")
+    else: # Default to MinMaxScaler
+        target_scaler = MinMaxScaler(feature_range=(-1, 1))
+        print(f"Using MinMaxScaler for target variable (y - {'delta' if predict_delta else 'state'}).")
+
+    # Fit scalers ONLY on training data
     try:
         print("Fitting scalers on training data..."); start_fit_time = time.time()
         X_train_scaled_reshaped = input_scaler.fit_transform(X_train_reshaped)
-        y_train_scaled = target_scaler.fit_transform(y_train)
+        y_train_scaled = target_scaler.fit_transform(y_train) # Fit target scaler on y_train
         print(f"Scaler fitting took {time.time()-start_fit_time:.2f}s")
 
         os.makedirs(config.MODELS_DIR, exist_ok=True)
         joblib.dump(input_scaler, config.INPUT_SCALER_PATH)
         joblib.dump(target_scaler, config.TARGET_SCALER_PATH)
-        print(f"Input scaler saved to {config.INPUT_SCALER_PATH}")
+        print(f"Input scaler ({config.INPUT_SCALER_TYPE}) saved to {config.INPUT_SCALER_PATH}")
         print(f"Target scaler ({config.TARGET_SCALER_TYPE}) saved to {config.TARGET_SCALER_PATH}")
     except Exception as e: print(f"Error fitting or saving scalers: {e}"); return (None,) * 4
 
@@ -138,7 +153,7 @@ def prepare_train_val_data_from_dfs(df_train, df_val, sequence_length=config.SEQ
     if X_val_reshaped.shape[0] > 0:
          try:
             X_val_scaled_reshaped = input_scaler.transform(X_val_reshaped)
-            y_val_scaled = target_scaler.transform(y_val)
+            y_val_scaled = target_scaler.transform(y_val) # Transform validation target
          except Exception as e: print(f"Error scaling validation data: {e}"); return (None, None, input_scaler, target_scaler)
     else: y_val_scaled = np.empty((0, num_output_features))
 
@@ -156,7 +171,7 @@ def prepare_train_val_data_from_dfs(df_train, df_val, sequence_length=config.SEQ
         train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2, persistent_workers=True)
         val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=2, persistent_workers=False) if val_dataset else None
         print("DataLoaders created.")
-        if val_loader is None: print("Warning: Validation DataLoader is None (no validation data).")
+        if val_loader is None: print("Warning: Validation DataLoader is None.")
 
     except Exception as e: print(f"Error creating Tensors or DataLoaders: {e}"); return (None, None, input_scaler, target_scaler)
 
@@ -171,16 +186,6 @@ def get_test_data_and_scalers(data_path=config.VAL_DATA_FILE, # Default to loadi
     """
     Loads scalers and prepares the validation/test set data (from data_path)
     and the corresponding dataframe slice needed for multi-step prediction evaluation.
-
-    Args:
-        data_path (str): Path to the CSV file containing the validation/test data.
-        sequence_length (int): Length of input sequences.
-        input_scaler_path (str): Path to the fitted input scaler.
-        target_scaler_path (str): Path to the fitted target scaler (output or delta).
-
-    Returns:
-        tuple: (X_val_scaled, df_for_pred, input_scaler, target_scaler)
-               Returns (None, None, None, None) if an error occurs.
     """
     print(f"Loading scalers and preparing evaluation data from: {data_path}")
     # --- Load Scalers ---
@@ -190,7 +195,12 @@ def get_test_data_and_scalers(data_path=config.VAL_DATA_FILE, # Default to loadi
         input_scaler = joblib.load(input_scaler_path)
         target_scaler = joblib.load(target_scaler_path) # Load the specified target scaler
         print(f"Scalers loaded ({input_scaler_path}, {target_scaler_path}).")
-    except Exception as e: print(f"Error loading scalers: {e}"); return None, None, None, None
+        # Basic check if scalers seem fitted (more robust checks might be needed)
+        if not hasattr(input_scaler, 'scale_') and not hasattr(input_scaler, 'min_'): # Check for attributes of either scaler type
+             raise ValueError("Input scaler does not appear to be fitted.")
+        if not hasattr(target_scaler, 'scale_') and not hasattr(target_scaler, 'min_'):
+             raise ValueError("Target scaler does not appear to be fitted.")
+    except Exception as e: print(f"Error loading or validating scalers: {e}"); return None, None, None, None
 
     # --- Load Specified Data File ---
     try:
@@ -214,8 +224,7 @@ def get_test_data_and_scalers(data_path=config.VAL_DATA_FILE, # Default to loadi
     # Scale the input sequences (X) using the loaded input scaler
     try:
         X_eval_reshaped = X_eval_all.reshape(-1, X_eval_all.shape[2])
-        X_eval_scaled_reshaped = input_scaler.transform(X_eval_reshaped)
-        X_eval_scaled = X_eval_scaled_reshaped.reshape(X_eval_all.shape)
+        X_eval_scaled = input_scaler.transform(X_eval_reshaped).reshape(X_eval_all.shape)
     except Exception as e: print(f"Error scaling evaluation data sequences: {e}"); return None, None, input_scaler, target_scaler
 
     # Prepare the dataframe slice needed for multi-step prediction ground truth
@@ -231,6 +240,3 @@ def get_test_data_and_scalers(data_path=config.VAL_DATA_FILE, # Default to loadi
     # Return scaled sequences, the prediction df slice, and both scalers
     return X_eval_scaled, df_for_pred, input_scaler, target_scaler
 
-# --- Comment out or remove the old stratified function if no longer needed ---
-# def create_stratified_train_val_data(...):
-#     ... (old implementation) ...
