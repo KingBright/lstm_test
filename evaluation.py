@@ -19,7 +19,7 @@ import utils
 def plot_training_curves(train_losses, val_losses, save_dir=config.FIGURES_DIR):
     """绘制并保存训练和验证损失曲线。"""
     if not train_losses or not isinstance(train_losses, list) or \
-       not val_losses or not isinstance(val_losses, list): print("警告: 损失列表无效或为空。"); return
+       not val_losses or not isinstance(val_losses, list): print("Warning: Invalid loss lists."); return
     try:
         plt.figure(figsize=(10, 6)); epochs = range(1, len(train_losses) + 1)
         plt.plot(epochs, train_losses, label=utils.safe_text('训练损失', 'Training Loss'))
@@ -29,7 +29,7 @@ def plot_training_curves(train_losses, val_losses, save_dir=config.FIGURES_DIR):
         plt.title(utils.safe_text('模型训练过程中的损失', 'Model Loss During Training')); plt.xlabel(utils.safe_text('周期', 'Epoch')); plt.ylabel(utils.safe_text('均方误差 (MSE)', 'Mean Squared Error (MSE)'))
         plt.legend(); plt.grid(True)
         valid_train_losses = [l for l in train_losses if l is not None and np.isfinite(l) and l > 1e-9]
-        if valid_train_losses and len(valid_train_losses) > 1 and (max(valid_train_losses) / max(1e-9, min(valid_train_losses))) > 100: plt.yscale('log'); print("信息: 训练曲线使用对数 Y 轴。")
+        if valid_train_losses and len(valid_train_losses) > 1 and (max(valid_train_losses) / max(1e-9, min(valid_train_losses))) > 100: plt.yscale('log'); print("Info: Using log scale for y-axis in training curves plot.")
         os.makedirs(save_dir, exist_ok=True); save_path = os.path.join(save_dir, 'training_curves.png')
         plt.savefig(save_path, dpi=300); plt.close()
         print(f"训练曲线图已保存到: {save_path}")
@@ -45,21 +45,21 @@ def evaluate_model(model, data_loader, criterion, device=None):
         elif torch.cuda.is_available(): device = torch.device("cuda")
         else: device = torch.device("cpu")
     model.to(device); model.eval(); total_loss = 0.0; batches = 0; start_time = time.time()
-    if data_loader is None: print("警告: evaluate_model 中的 data_loader 为 None。"); return float('inf')
+    if data_loader is None: print("Warning: data_loader is None in evaluate_model."); return float('inf')
     try: loader_len = len(data_loader.dataset) if hasattr(data_loader, 'dataset') else len(data_loader);
     except (TypeError, AttributeError): loader_len = 0
-    if loader_len == 0 and hasattr(data_loader, 'dataset'): print("警告: 评估数据集为空。"); return float('inf')
+    if loader_len == 0 and hasattr(data_loader, 'dataset'): print("Warning: Evaluation dataset is empty."); return float('inf')
     with torch.no_grad():
         for inputs, targets in data_loader: # targets shape: (batch, K, output_size)
             inputs, targets = inputs.to(device), targets.to(device)
             try: outputs = model(inputs) # outputs shape: (batch, K, output_size)
-            except Exception as e: print(f"评估模型前向传播错误: {e}"); return float('inf')
-            loss = criterion(outputs, targets) # MSELoss 计算所有元素的均方误差
-            if not torch.isfinite(loss): print("警告: 评估时损失为 NaN/Inf。"); return float('inf')
+            except Exception as e: print(f"Error during model evaluation forward pass: {e}"); return float('inf')
+            loss = criterion(outputs, targets) # MSELoss compares element-wise
+            if not torch.isfinite(loss): print("Warning: NaN or Inf loss detected."); return float('inf')
             total_loss += loss.item(); batches += 1
     avg_loss = total_loss / batches if batches > 0 else float('inf'); eval_time = time.time() - start_time
-    if np.isfinite(avg_loss): print(f'平均验证/测试损失 (MSE): {avg_loss:.6f}, 评估耗时: {eval_time:.2f}s')
-    else: print(f'评估得到无效的平均损失。耗时: {eval_time:.2f}s')
+    if np.isfinite(avg_loss): print(f'Average Validation/Test Loss (MSE): {avg_loss:.6f}, Evaluation Time: {eval_time:.2f}s')
+    else: print(f'Evaluation resulted in invalid average loss. Time: {eval_time:.2f}s')
     return avg_loss
 
 
@@ -77,7 +77,7 @@ def multi_step_prediction(model, initial_sequence, df_pred,
         model (nn.Module): 训练好的 Seq2Seq 模型。
         initial_sequence (np.array): 起始的输入序列 (已缩放), shape (input_seq_len, features)。
         df_pred (pd.DataFrame): 包含未来真实值的 DataFrame (至少需要 tau, time, theta, theta_dot)
-                                覆盖预测范围，索引应与预测步对齐。
+                                覆盖预测范围，索引应与预测步对齐 (0 to prediction_steps-1)。
         input_seq_len (int): 输入序列长度 (N)。
         output_seq_len (int): 模型输出序列的长度 (K)。
         prediction_steps (int): 要生成的总未来步数。如果为 None, 则预测 df_pred 的长度。
@@ -107,11 +107,9 @@ def multi_step_prediction(model, initial_sequence, df_pred,
          print(f"警告: df_pred 为空或短于请求步数 ({prediction_steps})。调整步数。")
          prediction_steps = len(df_pred)
     if prediction_steps <= 0: print("错误: 没有可预测的步数。"); return np.empty((0, num_output_features)), np.empty((0, num_output_features))
-    if not hasattr(input_scaler, 'scale_') or not hasattr(target_scaler, 'scale_'): print("错误: 输入或目标缩放器未拟合。"); return np.empty((0, num_output_features)), np.empty((0, num_output_features))
-    # 确认目标缩放器类型 (Seq2Seq 预测绝对状态)
-    if not isinstance(target_scaler, MinMaxScaler) and not isinstance(target_scaler, StandardScaler):
-         print(f"警告: 目标缩放器类型未知 ({type(target_scaler)}), 假设预测绝对状态。")
-    is_delta_prediction = False # Seq2Seq 当前设置为预测绝对状态
+    if not hasattr(input_scaler, 'scale_') or not hasattr(target_scaler, 'scale_'): print("错误: 缩放器未拟合。"); return np.empty((0, num_output_features)), np.empty((0, num_output_features))
+    # 假设 Seq2Seq 预测绝对状态
+    is_delta_prediction = False
 
     current_sequence_np = initial_sequence.copy() # 缩放后的输入序列 [t-N+1, ..., t]
     predicted_states_list = [] # 存储 *反标准化后* 的预测状态 [t+1, t+2, ...]
@@ -130,18 +128,14 @@ def multi_step_prediction(model, initial_sequence, df_pred,
                 # model_output_scaled shape: (1, K, output_size)
                 model_output_scaled_sequence = model(current_sequence_tensor).cpu().numpy()[0]
                 if not np.all(np.isfinite(model_output_scaled_sequence)): print(f"NaN/Inf detected at step {i}. Stopping."); break
-
-                # 我们只用预测的 K 步中的第一步来前滚
+                # 只取预测的 K 步中的第一步来前滚
                 next_step_output_scaled = model_output_scaled_sequence[0, :] # Shape: (output_size,)
-
             except Exception as e: print(f"模型前向传播错误 step {i}: {e}"); break
 
             # --- 状态更新 (反标准化预测的第一步) ---
             try:
-                # 反标准化预测的 state(t+1)
                 current_state_unscaled = target_scaler.inverse_transform(next_step_output_scaled.reshape(1, -1))[0]
                 predicted_states_list.append(current_state_unscaled) # 存储预测的 state(t+1)
-
             except Exception as e: print(f"状态反标准化错误 step {i}: {e}"); break
 
             # --- 准备下一步的输入 ---
@@ -149,17 +143,14 @@ def multi_step_prediction(model, initial_sequence, df_pred,
             try:
                 # 需要 t+1 时刻的 tau (在 df_pred 的索引 i 处)
                 next_tau_original = df_pred.iloc[i]['tau']
-
                 # 处理 sin/cos 特征 (如果启用)
                 pred_theta, pred_theta_dot = current_state_unscaled[0], current_state_unscaled[1]
                 if config.USE_SINCOS_THETA:
                      next_input_features_unscaled = np.array([np.sin(pred_theta), np.cos(pred_theta), pred_theta_dot, next_tau_original])
                 else:
                      next_input_features_unscaled = np.array([pred_theta, pred_theta_dot, next_tau_original])
-
                 # 标准化这个新的特征向量
                 next_step_features_scaled = input_scaler.transform(next_input_features_unscaled.reshape(1, -1))[0]
-
             except IndexError: print(f"警告: 在 df_pred 中找不到 tau 输入 step {i}. 停止。"); break
             except Exception as e: print(f"准备下一步输入时出错 step {i}: {e}"); break
 
@@ -170,33 +161,20 @@ def multi_step_prediction(model, initial_sequence, df_pred,
     # --- 处理结果 ---
     actual_prediction_steps = len(predicted_states_list)
     if actual_prediction_steps == 0: return np.empty((0, num_output_features)), np.empty((0, num_output_features))
-
     predicted_states_original = np.array(predicted_states_list)
-    # 获取对应的真实状态 (从 t+1 到 t+actual_steps)
     true_states_original = df_pred.iloc[:actual_prediction_steps][['theta', 'theta_dot']].values
-
-    # 最终长度检查
-    if len(predicted_states_original) != len(true_states_original):
-        min_len = min(len(predicted_states_original), len(true_states_original))
-        predicted_states_original = predicted_states_original[:min_len]
-        true_states_original = true_states_original[:min_len]
-
-    if len(predicted_states_original) > 0:
-        mse = np.mean((predicted_states_original - true_states_original)**2)
-        print(f"多步预测 MSE ({actual_prediction_steps} 步): {mse:.6f}")
+    if len(predicted_states_original) != len(true_states_original): min_len = min(len(predicted_states_original), len(true_states_original)); predicted_states_original = predicted_states_original[:min_len]; true_states_original = true_states_original[:min_len]
+    if len(predicted_states_original) > 0: mse = np.mean((predicted_states_original - true_states_original)**2); print(f"多步预测 MSE ({actual_prediction_steps} 步): {mse:.6f}")
     else: print("无法计算多步预测 MSE。")
-
     return predicted_states_original, true_states_original
 
 
-# --- Plotting Multi-Step Prediction (remains the same, plots one case) ---
+# --- Plotting Multi-Step Prediction (保持不变, 绘制单次预测结果) ---
 def plot_multi_step_prediction(time_vector, true_states, predicted_states,
                                physics_model_predictions=None, model_name="LSTM",
                                save_dir=config.FIGURES_DIR, filename_base="multi_step_prediction"):
-    """
-    绘制多步预测与真实轨迹的比较。
-    """
-    # ... (绘图函数的实现保持不变，它绘制传入的 time, true, predicted 数据) ...
+    """绘制多步预测与真实轨迹的比较。"""
+    # ... (绘图函数的实现保持不变，绘制6个子图) ...
     if not all(isinstance(arr, np.ndarray) for arr in [time_vector, true_states, predicted_states]) or \
        len(predicted_states) == 0 or len(true_states) == 0 or len(time_vector) == 0: print(f"Warning: Empty data for plotting '{filename_base}'."); return
     min_len = len(predicted_states); # ... (length adjustment logic) ...
@@ -241,8 +219,7 @@ def plot_multi_step_prediction(time_vector, true_states, predicted_states,
         plt.savefig(save_path, dpi=300, bbox_inches='tight'); plt.close()
     except Exception as e: print(f"Error plotting multi-step prediction for '{filename_base}': {e}"); import traceback; traceback.print_exc(); plt.close()
 
-
-# --- Remove Consolidated Evaluation and Grid Plotting ---
+# --- Removed Consolidated Evaluation and Grid Plotting ---
 # def run_multi_scenario_evaluation(...): ...
 # def _plot_grid_internal(...): ...
 # def plot_multi_scenario_grid_angle(...): ...

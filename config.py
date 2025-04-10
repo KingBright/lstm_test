@@ -110,6 +110,7 @@ INPUT_SCALER_PATH = os.path.join(MODELS_DIR, INPUT_SCALER_FILENAME)
 
 # --- Evaluation Parameters ---
 GOOD_MSE_THRESHOLD = 0.01 # Keep threshold, might need adjustment
+PHYSICS_VALIDATION_TOLERANCE = 1e-3 # <<<--- 新增：物理校验的容忍度
 
 # --- Misc ---
 SEED = 42
