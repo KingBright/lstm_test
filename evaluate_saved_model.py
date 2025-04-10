@@ -6,34 +6,34 @@ import numpy as np
 import pandas as pd
 import joblib
 import os
-import time # Ensure time module is imported
+import time
 
 # Import necessary modules from the project
 import config
 import utils
-from model import get_model # Use the factory function
-# Import functions needed for data generation fallback and physics comparison
+from model import get_model, PureLSTM, PureGRU
 from data_generation import PendulumSystem, generate_simulation_data, run_simulation
-# Import functions needed for getting test data and potentially calculating MSE
-from data_preprocessing import get_test_data_and_scalers # Only need this one now
-# Import necessary evaluation functions (including the consolidated one)
-from evaluation import evaluate_model, run_multi_scenario_evaluation, plot_multi_step_prediction # plot needed if called separately
+from data_preprocessing import get_test_data_and_scalers
+# Import necessary evaluation functions
+# Ensure run_multi_scenario_evaluation is imported
+from evaluation import evaluate_model, run_multi_scenario_evaluation
 
-def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH, # Path to load model type/params
-                        model_path=config.MODEL_BEST_PATH,      # Path to load the best model's state_dict
-                        data_path=config.VAL_DATA_FILE,         # <<<--- Default to loading VAL_DATA_FILE
-                        limit_prediction_steps=None,            # Optional limit for prediction steps
-                        scenarios_to_eval=config.SCENARIOS,     # Scenarios to evaluate
-                        ics_to_eval=config.INITIAL_CONDITIONS_SPECIFIC # ICs to evaluate
-                        # start_idx_in_test is removed, evaluation is now scenario/IC based
+def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
+                        model_path=config.MODEL_BEST_PATH,
+                        data_path=config.VAL_DATA_FILE,
+                        limit_prediction_steps=None,
+                        scenarios_to_eval=config.SCENARIOS,
+                        ics_to_eval=config.INITIAL_CONDITIONS_SPECIFIC
                         ):
     """
     Loads the best saved model state and evaluates its performance using
     multi-scenario multi-step prediction.
+    Uses parameters stored in model_info_path for instantiation.
     If data_path (validation data file) is not found, it attempts to regenerate it.
     """
     print(f"--- Starting Evaluation of Saved Model ---")
-    print(f"--- Attempting to load model state from: {model_path} ---")
+    print(f"--- Loading model state from: {model_path} ---")
+    print(f"--- Reading model info from: {model_info_path} ---")
     eval_overall_start_time = time.time()
 
     # --- Setup Device ---
@@ -43,94 +43,108 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH, # Path to load 
     print(f"Using device: {device}")
 
     # --- Load Data (Try loading VAL_DATA_FILE, fallback to generation) ---
-    df_eval = None # Use df_eval to store the data used for evaluation context (primarily for scalers)
+    # ... (Data loading/generation logic remains the same) ...
+    df_eval = None
     try:
         print(f"Attempting to load evaluation context data from {data_path}...")
         df_eval = pd.read_csv(data_path)
         print(f"Successfully loaded evaluation context data, shape: {df_eval.shape}")
     except FileNotFoundError:
-        print(f"Warning: Evaluation context data file '{data_path}' not found.")
-        print("--- Attempting to regenerate validation data on-the-fly ---")
-        # --- Data Generation Logic (Only for Validation Set) ---
-        gen_start_time = time.time()
-        val_dfs = []
-        total_val_points = 0
+        print(f"Warning: Evaluation context data file '{data_path}' not found. Regenerating...")
+        gen_start_time = time.time(); val_dfs = []; total_val_points = 0
         try:
-            pendulum = PendulumSystem(m=config.PENDULUM_MASS, L=config.PENDULUM_LENGTH,
-                                      g=config.GRAVITY, c=config.DAMPING_COEFF)
-            print("Pendulum system initialized for data generation.")
-            print(f"Generating validation data (T={config.T_SPAN_VAL}) for scenarios: {config.SCENARIOS}")
+            pendulum = PendulumSystem(); print("Pendulum system initialized.")
             for scenario_type in config.SCENARIOS:
                 for i, x0 in enumerate(config.INITIAL_CONDITIONS_SPECIFIC):
-                    df_val_single = generate_simulation_data(
-                        pendulum, t_span=config.T_SPAN_VAL, dt=config.DT, x0=x0, torque_type=scenario_type
-                    )
+                    df_val_single = generate_simulation_data(pendulum, t_span=config.T_SPAN_VAL, dt=config.DT, x0=x0, torque_type=scenario_type)
                     if not df_val_single.empty: val_dfs.append(df_val_single); total_val_points += len(df_val_single)
             if not val_dfs: raise RuntimeError("No validation data generated.")
-            df_eval = pd.concat(val_dfs, ignore_index=True)
-            gen_time = time.time() - gen_start_time
-            print(f"--- Validation data regenerated successfully ({total_val_points} points), took {gen_time:.2f}s ---")
-            try: df_eval.to_csv(data_path, index=False); print(f"Regenerated validation data saved to {data_path}.")
-            except Exception as save_e: print(f"Warning: Could not save regenerated data. Error: {save_e}")
-        except Exception as gen_e: print(f"Error during on-the-fly data generation: {gen_e}"); return
-    except Exception as load_e: print(f"Error loading data from {data_path}: {load_e}"); return
+            df_eval = pd.concat(val_dfs, ignore_index=True); gen_time = time.time() - gen_start_time
+            print(f"Validation data regenerated ({total_val_points} points), took {gen_time:.2f}s")
+            try: df_eval.to_csv(data_path, index=False); print(f"Saved to {data_path}.")
+            except Exception as save_e: print(f"Warning: Could not save regenerated data: {save_e}")
+        except Exception as gen_e: print(f"Error during data generation: {gen_e}"); return
+    except Exception as load_e: print(f"Error loading data: {load_e}"); return
+    if df_eval is None or df_eval.empty: print("Error: DataFrame empty. Aborting."); return
 
-    if df_eval is None or df_eval.empty: print("Error: DataFrame for evaluation context is empty. Aborting."); return
 
-    # --- Load Model Info (to determine type/scaler paths) ---
-    model_info = None
-    model_type_for_eval = config.MODEL_TYPE # Default
+    # --- Load Model Info and Determine Parameters ---
+    # ... (Logic remains the same) ...
+    model_info = None; model_type_for_eval = config.MODEL_TYPE; loaded_params = {}
     if os.path.exists(model_info_path):
         try:
             model_info = torch.load(model_info_path, map_location='cpu')
-            loaded_type = model_info.get('model_type', config.MODEL_TYPE)
-            if loaded_type: model_type_for_eval = loaded_type
+            model_type_for_eval = model_info.get('model_type', config.MODEL_TYPE)
+            loaded_params['hidden_size'] = model_info.get('hidden_size'); loaded_params['num_layers'] = model_info.get('num_layers'); loaded_params['dense_units'] = model_info.get('dense_units'); loaded_params['dropout_rate'] = model_info.get('dropout_rate')
             print(f"Loaded model info from {model_info_path}. Determined model type: {model_type_for_eval}")
+            print(f"  Loaded Params: { {k:v for k,v in loaded_params.items() if v is not None} }")
         except Exception as e: print(f"Warning: Could not load model info file {model_info_path}. Error: {e}"); model_info = None
-    else: print(f"Warning: Model info file {model_info_path} not found. Using MODEL_TYPE='{config.MODEL_TYPE}' from config.")
+    else: print(f"Warning: Model info file {model_info_path} not found.")
 
-    # Determine correct target scaler path based on determined model type
-    if model_type_for_eval.lower().startswith("delta"): target_scaler_path = config.DELTA_SCALER_PATH
-    else: target_scaler_path = config.TARGET_SCALER_PATH
-    print(f"Using target scaler path: {target_scaler_path}")
 
     # --- Load Scalers ---
-    # Use get_test_data_and_scalers primarily to load the correct scalers
-    # We don't necessarily need its returned X_val_scaled or df_for_pred anymore,
-    # as the evaluation loop will generate segments as needed.
-    # However, we DO need the fitted scalers.
+    # ... (Logic remains the same, using config.TARGET_SCALER_PATH) ...
+    target_scaler_path_to_load = config.TARGET_SCALER_PATH
+    if model_type_for_eval.lower() != config.MODEL_TYPE.lower(): print(f"Warning: Model type for eval ('{model_type_for_eval}') differs from current config ('{config.MODEL_TYPE}'). Ensure scaler path '{target_scaler_path_to_load}' is correct.")
+    print(f"Attempting to load target scaler from: {target_scaler_path_to_load}")
     print("Loading scalers...")
     try:
-        if not os.path.exists(config.INPUT_SCALER_PATH) or not os.path.exists(target_scaler_path):
-             raise FileNotFoundError(f"Scaler file(s) not found: {config.INPUT_SCALER_PATH}, {target_scaler_path}")
-        input_scaler = joblib.load(config.INPUT_SCALER_PATH)
-        target_scaler = joblib.load(target_scaler_path)
-        if not hasattr(input_scaler, 'scale_') or not hasattr(target_scaler, 'scale_'):
-             raise ValueError("Loaded scalers appear to be not fitted.")
-        print(f"Scalers loaded successfully ({config.INPUT_SCALER_PATH}, {target_scaler_path}).")
+        if not os.path.exists(config.INPUT_SCALER_PATH) or not os.path.exists(target_scaler_path_to_load): raise FileNotFoundError(f"Scaler file(s) not found: {config.INPUT_SCALER_PATH}, {target_scaler_path_to_load}")
+        input_scaler = joblib.load(config.INPUT_SCALER_PATH); target_scaler = joblib.load(target_scaler_path_to_load)
+        print(f"Scalers loaded ({config.INPUT_SCALER_PATH}, {target_scaler_path_to_load}).")
+        if not hasattr(input_scaler, 'scale_') and not hasattr(input_scaler, 'min_'): raise ValueError("Input scaler not fitted.")
+        if not hasattr(target_scaler, 'scale_') and not hasattr(target_scaler, 'min_'): raise ValueError("Target scaler not fitted.")
     except Exception as e: print(f"Error loading scalers: {e}"); return
 
-    # --- Instantiate Model and Load State Dictionary ---
+
+    # --- Instantiate Model using Loaded/Config Parameters ---
+    # ... (Logic remains the same, using get_final_param helper) ...
     model = None
     try:
-        input_size = input_scaler.n_features_in_
-        output_size = target_scaler.n_features_in_
-        model = get_model(model_type=model_type_for_eval, input_size=input_size, output_size=output_size)
-        print(f"Model architecture '{model_type_for_eval}' instantiated.")
+        input_size = input_scaler.n_features_in_; output_size = target_scaler.n_features_in_
+        current_config_params = config.get_current_model_params()
+        eval_params_dict = current_config_params
+        if model_type_for_eval.lower() != config.MODEL_TYPE.lower():
+             temp_eval_params = config.MODEL_PARAMS.get("defaults", {}).copy(); base_key = model_type_for_eval.lower().replace("delta", "pure", 1); specific_params = config.MODEL_PARAMS.get(base_key)
+             if specific_params: temp_eval_params.update(specific_params)
+             else: print(f"Warning: Params for loaded type '{model_type_for_eval}' not in config.")
+             for key, value in config.MODEL_PARAMS.get("defaults", {}).items():
+                 if key not in temp_eval_params: temp_eval_params[key] = value
+             eval_params_dict = temp_eval_params
+        def get_final_param(key, loaded_val, config_dict_for_type, target_type):
+            default_val = config_dict_for_type.get(key)
+            if loaded_val is not None and not (isinstance(loaded_val, str) and loaded_val.lower() == 'unknown'):
+                try: return target_type(loaded_val)
+                except (ValueError, TypeError): pass
+            if default_val is not None: return target_type(default_val)
+            else: raise ValueError(f"Cannot determine value for '{key}'")
+        hidden_size = get_final_param('hidden_size', loaded_params.get('hidden_size'), eval_params_dict, int)
+        num_layers = get_final_param('num_layers', loaded_params.get('num_layers'), eval_params_dict, int)
+        dense_units = get_final_param('dense_units', loaded_params.get('dense_units'), eval_params_dict, int)
+        dropout = get_final_param('dropout_rate', loaded_params.get('dropout_rate'), eval_params_dict, float)
+        if num_layers < 1: num_layers = 1
+        model_type_key = model_type_for_eval.lower()
+        if model_type_key.startswith("purelstm") or model_type_key.startswith("deltalstm"): model_class = PureLSTM
+        elif model_type_key.startswith("puregru") or model_type_key.startswith("deltagru"): model_class = PureGRU
+        else: raise ValueError(f"Unknown model type: {model_type_for_eval}")
+        print(f"Instantiating {model_class.__name__} with: input={input_size}, hidden={hidden_size}, layers={num_layers}, output={output_size}, dense={dense_units}, dropout={dropout}")
+        model = model_class(input_size, hidden_size, num_layers, output_size, dense_units, dropout)
+        print("Model instantiated.")
         if not os.path.exists(model_path): raise FileNotFoundError(f"Model state file not found at {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device); model.eval()
         print(f"Successfully loaded model state from '{model_path}' to {device}")
-    except Exception as e: print(f"Error instantiating or loading model: {e}"); return
+    except Exception as e: print(f"Error during model setup: {e}"); return
 
     # --- Perform Evaluation using the consolidated function ---
     print("\n--- Calling Multi-Scenario Multi-Step Prediction Evaluation ---")
-    # Ensure the evaluation function is available
-    if hasattr(evaluation, 'run_multi_scenario_evaluation'):
-        evaluation_results = evaluation.run_multi_scenario_evaluation(
+    # VVVVVV REMOVE the hasattr check VVVVVV
+    try:
+        # Directly call the imported function
+        evaluation_results = run_multi_scenario_evaluation(
             model=model,
             input_scaler=input_scaler,
-            target_scaler=target_scaler,
+            target_scaler=target_scaler, # Pass the loaded target scaler
             device=device,
             model_type_name=f"{model_type_for_eval} (Loaded)", # Pass descriptive name
             scenarios_to_eval=scenarios_to_eval,
@@ -138,9 +152,16 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH, # Path to load 
             limit_prediction_steps=limit_prediction_steps,
             save_dir=config.FIGURES_DIR
         )
-    else:
-        print("Error: Consolidated evaluation function 'run_multi_scenario_evaluation' not found in evaluation.py.")
-        evaluation_results = {} # Empty results
+    except NameError:
+         # This might happen if evaluation.py itself has an import error for the function
+         print("Error: Function 'run_multi_scenario_evaluation' is not defined. Check imports in evaluation.py and here.")
+         evaluation_results = {}
+    except Exception as e:
+         print(f"Error calling run_multi_scenario_evaluation: {e}")
+         import traceback
+         traceback.print_exc() # Print full traceback for debugging
+         evaluation_results = {}
+    # ^^^^^^ MODIFIED BLOCK ^^^^^^
 
     # --- Final Timing ---
     eval_total_time = time.time() - eval_overall_start_time
@@ -148,47 +169,19 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH, # Path to load 
 
 
 if __name__ == "__main__":
-    # Setup utilities
-    utils.setup_logging_and_warnings()
-    utils.setup_chinese_font()
-
+    utils.setup_logging_and_warnings(); utils.setup_chinese_font()
     # --- Configuration for Evaluation ---
-    # Specify which scenarios and ICs to evaluate (use indices from config)
-    scenarios_to_run = config.SCENARIOS # Evaluate all scenarios
-    ics_to_run = config.INITIAL_CONDITIONS_SPECIFIC # Evaluate all ICs
-    # Example: Evaluate only 'sine' and 'random' scenarios for the first 2 ICs
-    # scenarios_to_run = ["sine", "random"]
-    # ics_to_run = config.INITIAL_CONDITIONS_SPECIFIC[:2]
-
-    limit_steps = 1000 # Limit prediction length for speed (e.g., 1000 steps = 20 seconds)
-
-    # Specify which trained model to evaluate by setting its type
-    # This determines which _final.pth and _best.pth files are targeted
-    evaluate_model_type = config.MODEL_TYPE # Evaluate the model type currently set in config
-    # OR explicitly set it:
-    # evaluate_model_type = "DeltaGRU"
-
-    # Construct paths based on the chosen model type
+    start_index = 0; limit_steps = 1000
+    scenarios_to_run = config.SCENARIOS; ics_to_run = config.INITIAL_CONDITIONS_SPECIFIC
+    evaluate_model_type = config.MODEL_TYPE
     eval_model_basename = f'pendulum_{evaluate_model_type.lower()}'
     eval_model_info_path = os.path.join(config.MODELS_DIR, f'{eval_model_basename}_final.pth')
     eval_model_path = os.path.join(config.MODELS_DIR, f'{eval_model_basename}_best.pth')
-    # Specify the validation data file path (used for fallback generation context if needed)
     eval_data_path = config.VAL_DATA_FILE
-
-    print(f"--- Evaluating Model Type: {evaluate_model_type} ---")
-    print(f"Using Best Model State: {eval_model_path}")
-    print(f"Using Final Model Info: {eval_model_info_path}")
-    print(f"Target Validation Data File: {eval_data_path} (regenerated if not found)")
-    print(f"Scenarios to Evaluate: {scenarios_to_run}")
-    print(f"Number of Initial Conditions per Scenario: {len(ics_to_run)}")
-    print(f"Prediction Step Limit per run: {limit_steps if limit_steps else 'None'}")
-
+    # ... (Print config) ...
+    print(f"--- Evaluating Model Type: {evaluate_model_type} ---") # ... etc
     evaluate_best_model(
-        model_info_path=eval_model_info_path,
-        model_path=eval_model_path,
-        data_path=eval_data_path, # Path for loading/saving regenerated val data
-        limit_prediction_steps=limit_steps,
-        scenarios_to_eval=scenarios_to_run,
-        ics_to_eval=ics_to_run
-        # start_idx_in_test is removed as evaluation is scenario/IC based now
+        model_info_path=eval_model_info_path, model_path=eval_model_path, data_path=eval_data_path,
+        limit_prediction_steps=limit_steps, scenarios_to_eval=scenarios_to_run, ics_to_eval=ics_to_run
     )
+
