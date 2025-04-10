@@ -32,8 +32,8 @@ MODEL_PARAMS = {
     "deltalstm":{ "hidden_size": 32, "num_layers": 2 },
     "deltagru": { "hidden_size": 32, "num_layers": 2 },
     # Add specific params for Seq2Seq if needed, otherwise they use base params
-    "seq2seqlstm":{ "hidden_size": 32, "num_layers": 2 },
-    "seq2seqgru": { "hidden_size": 32, "num_layers": 2 }
+    "seq2seqlstm":{ "hidden_size": 10, "num_layers": 2 },
+    "seq2seqgru": { "hidden_size": 10, "num_layers": 1 }
 }
 # Function to get parameters (remains the same, handles base types)
 def get_current_model_params():

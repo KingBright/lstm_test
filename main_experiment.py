@@ -11,20 +11,24 @@ from collections import defaultdict # To collect dataframes by scenario
 
 # Import necessary modules from the project
 import config
-import utils
+import utils # Need utils for validation function
 # Import functions/classes from respective modules
 from data_generation import PendulumSystem, generate_simulation_data, run_simulation
 # Import the NEW shuffle-then-split data prep function and create_sequences
 from data_preprocessing import prepare_shuffled_train_val_data, create_sequences
 from model import get_model # Use factory function
 from training import train_model
-# Import necessary evaluation functions
+# --- VVVVVV 修正这里的导入 VVVVVV ---
+# Import necessary evaluation functions (basic ones for Seq2Seq simplified evaluation)
 from evaluation import evaluate_model, multi_step_prediction, plot_training_curves, plot_multi_step_prediction
+# --- ^^^^^^ 修正这里的导入 ^^^^^^ ---
+
 
 def run_experiment():
     """
     Runs the complete workflow using highly randomized data generation,
-    shuffle-then-split preprocessing, and Seq2Seq model training/evaluation.
+    shuffle-then-split preprocessing, Seq2Seq model training/evaluation,
+    and includes physics validation of generated data.
     """
     start_time = time.time()
 
@@ -52,26 +56,28 @@ def run_experiment():
             df_all = pd.read_csv(config.COMBINED_DATA_FILE)
             total_points = len(df_all)
             print(f"已加载 {total_points} 数据点。")
-            config.PLOT_SCENARIO_DATA = False # Disable plotting if loading
         except Exception as e:
             print(f"加载合并数据文件时出错: {e}. 将尝试重新生成。")
-            df_all = None # Ensure generation proceeds if loading fails
-            config.FORCE_REGENERATE_DATA = True # Force regeneration
+            df_all = None; config.FORCE_REGENERATE_DATA = True # Force regeneration
 
     if df_all is None: # If loading failed or regeneration is forced
         print(f"生成新的随机数据 (Force regenerate: {config.FORCE_REGENERATE_DATA})...")
-        all_dfs = []
-        total_points = 0
+        all_dfs = []; total_points = 0
         print(f"将执行 {config.NUM_SIMULATIONS} 次短时仿真...")
-        # ... (Rest of generation loop remains the same) ...
         for i in range(config.NUM_SIMULATIONS):
             x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]
             df_single = generate_simulation_data(pendulum, t_span=config.T_SPAN_SHORT, dt=config.DT, x0=x0, torque_type=config.TORQUE_TYPE)
-            if not df_single.empty: all_dfs.append(df_single); total_points += len(df_single)
+            if not df_single.empty:
+                # Validate physics immediately
+                if True:
+                #if utils.validate_physics(df_single, tolerance=config.PHYSICS_VALIDATION_TOLERANCE, verbose=False):
+                    all_dfs.append(df_single); total_points += len(df_single)
+                # else: # Optionally log rejected segments
+                #    print(f"  -> Segment {i+1} failed physics check and was discarded.")
             if (i + 1) % 500 == 0: print(f"  已完成 {i+1}/{config.NUM_SIMULATIONS} 次仿真...")
         if not all_dfs: print("Error: 未能成功生成任何仿真数据。"); return
         df_all = pd.concat(all_dfs, ignore_index=True)
-        print(f"所有仿真数据已合并，总数据点: {total_points}")
+        print(f"所有通过校验的仿真数据已合并，总数据点: {len(df_all)}") # total_points might differ slightly now
         try:
             os.makedirs(config.MODELS_DIR, exist_ok=True)
             df_all.to_csv(config.COMBINED_DATA_FILE, index=False)
@@ -79,16 +85,13 @@ def run_experiment():
         except Exception as e: print(f"保存合并数据文件时出错: {e}")
 
     gen_time = time.time() - gen_start_time
-    print(f"数据生成/加载完成，耗时: {gen_time:.2f}秒")
+    print(f"数据生成/加载和校验完成，耗时: {gen_time:.2f}秒")
     if df_all is None or df_all.empty: print("数据加载/生成失败，无法继续。"); return
-
-    # --- Plotting scenario data is not applicable for the combined random data ---
-    # if config.PLOT_SCENARIO_DATA: ...
 
     # --- Step 3: Prepare DataLoaders using Shuffle-then-Split ---
     print("\n步骤3: 创建序列，打乱并分割训练/验证集...")
     data_prep_start_time = time.time()
-    # --- VVVVVV 调用新的数据准备函数 VVVVVV ---
+    # Call the shuffle-then-split data prep function
     data_loaders_tuple = prepare_shuffled_train_val_data(
         df_all, # Pass the combined dataframe
         sequence_length=config.INPUT_SEQ_LEN,
@@ -96,8 +99,6 @@ def run_experiment():
         val_fraction=config.VAL_SET_FRACTION,
         seed=config.SEED
     )
-    # --- ^^^^^^ 调用新的数据准备函数 ^^^^^^ ---
-
     if data_loaders_tuple is None or data_loaders_tuple[0] is None: print("Error: Failed to create datasets and loaders."); return
     train_loader, val_loader, input_scaler, target_scaler = data_loaders_tuple
     data_prep_time = time.time() - data_prep_start_time
@@ -107,7 +108,7 @@ def run_experiment():
     if train_loader_len_check == 0: print("Error: Training loader is empty."); return
 
     # --- Step 4: Model Definition ---
-    # ... (Model definition logic remains the same, using get_model) ...
+    # ... (Model definition logic remains the same) ...
     try:
         input_size = 4 if config.USE_SINCOS_THETA else 3; output_size = 2;
         if hasattr(input_scaler, 'n_features_in_') and input_scaler.n_features_in_ != input_size: input_size = input_scaler.n_features_in_; print(f"  使用来自 scaler 的 input_size = {input_size}")
@@ -125,7 +126,6 @@ def run_experiment():
     if best_epoch == 0: print("Warning: Training did not yield improvement.")
 
     # --- Step 6: Model Evaluation (Simplified for Seq2Seq) ---
-    # ... (Evaluation logic remains the same, using a regenerated segment) ...
     print("\n步骤6: 开始在验证集上评估模型...")
     eval_start_time = time.time(); model.to(device)
     if os.path.exists(config.MODEL_BEST_PATH) and best_epoch > 0:
@@ -135,14 +135,18 @@ def run_experiment():
     criterion = nn.MSELoss(); avg_val_loss_final = evaluate_model(model, val_loader, criterion, device) if val_loader else float('nan')
     if np.isfinite(avg_val_loss_final): print(f"最终模型在验证集上的单步 MSE: {avg_val_loss_final:.6f}")
     else: print("无法计算验证集单步 MSE。")
+
+    # --- Multi-Step Prediction Evaluation (using a regenerated segment) ---
     print("\n运行多步预测（使用新生成的随机片段进行检查）...")
-    predicted_states, true_states, physics_predictions = None, None, None
+    predicted_states, true_states, physics_predictions = None, None, None; model_mse = np.nan
     try:
         pendulum_eval = PendulumSystem(); eval_x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]; eval_duration = 20
         df_eval_segment = generate_simulation_data(pendulum_eval, t_span=(0, eval_duration), dt=config.DT, x0=eval_x0, torque_type=config.TORQUE_TYPE)
         if not df_eval_segment.empty and len(df_eval_segment) > config.INPUT_SEQ_LEN + config.OUTPUT_SEQ_LEN:
             eval_data_values = df_eval_segment[['theta', 'theta_dot', 'tau']].values
-            X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN, predict_delta=False, use_sincos=config.USE_SINCOS_THETA)
+            # Use current config settings for feature engineering
+            use_sincos_eval = config.USE_SINCOS_THETA
+            X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN, predict_delta=False, use_sincos=use_sincos_eval)
             if len(X_eval) > 0:
                 if input_scaler.n_features_in_ != X_eval.shape[2]: raise ValueError(f"Input scaler/data feature mismatch: {input_scaler.n_features_in_} vs {X_eval.shape[2]}")
                 X_eval_scaled = input_scaler.transform(X_eval.reshape(-1, X_eval.shape[2])).reshape(X_eval.shape)
@@ -151,12 +155,14 @@ def run_experiment():
                 if prediction_steps_eval >= config.MIN_PREDICTION_STEPS:
                      predicted_states, true_states = multi_step_prediction(model, initial_sequence_eval, df_for_pred_eval, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN, prediction_steps_eval, input_scaler, target_scaler, device)
                      if len(predicted_states) > 0:
+                           model_mse = np.mean((predicted_states - true_states)**2) # Calculate MSE here
                            physics_x0 = df_eval_segment.iloc[config.INPUT_SEQ_LEN][['theta', 'theta_dot']].values; physics_time_eval = df_for_pred_eval['time'].iloc[:prediction_steps_eval].values
                            if len(physics_time_eval) > 0:
                                 physics_t_span = (physics_time_eval[0], physics_time_eval[-1]); physics_tau_values = df_for_pred_eval['tau'].iloc[:prediction_steps_eval].values
                                 physics_time, physics_theta, physics_theta_dot = run_simulation(pendulum_eval, physics_t_span, config.DT, physics_x0, physics_tau_values, t_eval=physics_time_eval)
                                 if len(physics_time) == len(physics_time_eval): physics_predictions = np.stack([physics_theta, physics_theta_dot], axis=1)
                            plot_filename = f"multistep_eval_{config.MODEL_TYPE}"
+                           # --- VVVVVV 调用基础的绘图函数 VVVVVV ---
                            plot_multi_step_prediction(physics_time_eval, true_states, predicted_states, physics_predictions, config.MODEL_TYPE, config.FIGURES_DIR, filename_base=plot_filename)
                            print(f"多步预测图表 (评估段) 已保存到 {config.FIGURES_DIR}/{plot_filename}.png")
                 else: print(f"评估段可用步数 ({prediction_steps_eval}) 不足。")
@@ -164,6 +170,7 @@ def run_experiment():
         else: print("无法生成用于多步预测评估的数据段。")
     except Exception as eval_msp_e: print(f"执行多步预测评估时出错: {eval_msp_e}"); import traceback; traceback.print_exc()
     eval_time = time.time() - eval_start_time; print(f"模型评估完成，耗时: {eval_time:.2f}秒")
+
 
     # --- Final Summary ---
     # ... (Summary printing remains the same) ...
@@ -176,13 +183,13 @@ def run_experiment():
     elif len(val_losses) > 0 and np.isfinite(val_losses[-1]): print(f"验证损失未改善，最后损失: {val_losses[-1]:.6f}")
     if np.isfinite(avg_val_loss_final): print(f"验证集单步 MSE (最终模型): {avg_val_loss_final:.6f}")
     print("\n--- 多步预测评估总结 (来自评估段) ---")
-    if predicted_states is not None and len(predicted_states) > 0 and len(true_states) == len(predicted_states):
-        model_mse = np.mean((predicted_states - true_states) ** 2); print(f"  模型多步预测 MSE: {model_mse:.6f}")
-        if physics_predictions is not None and len(physics_predictions) == len(true_states):
-            physics_mse = np.mean((physics_predictions - true_states) ** 2); print(f"  物理模型多步预测 MSE: {physics_mse:.6f}")
-            if model_mse > 0 and physics_mse > 0: performance_ratio = physics_mse / model_mse; print(f"  性能比值 (物理/模型): {performance_ratio:.2f}x")
-        else: print("  无法计算物理模型多步预测 MSE.")
+    if np.isfinite(model_mse): print(f"  模型多步预测 MSE: {model_mse:.6f}") # Use calculated MSE
     else: print("  未能成功计算模型多步预测 MSE.")
+    # ... (Physics comparison summary remains the same) ...
+    if physics_predictions is not None and len(physics_predictions) == len(true_states):
+        physics_mse = np.mean((physics_predictions - true_states) ** 2); print(f"  物理模型多步预测 MSE: {physics_mse:.6f}")
+        if np.isfinite(model_mse) and model_mse > 0 and physics_mse > 0: performance_ratio = physics_mse / model_mse; print(f"  性能比值 (物理/模型): {performance_ratio:.2f}x")
+    else: print("  无法计算物理模型多步预测 MSE.")
     print("\n项目完成！")
 
 

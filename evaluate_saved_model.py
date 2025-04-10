@@ -12,17 +12,19 @@ import time
 import config
 import utils
 from model import get_model, PureLSTM, PureGRU
+# Import functions needed for data generation fallback and physics comparison
 from data_generation import PendulumSystem, generate_simulation_data, run_simulation
-from data_preprocessing import create_sequences # Need this for generated segment
-# Import necessary evaluation functions
+# Import sequence creation
+from data_preprocessing import create_sequences
+# Import necessary evaluation functions - basic ones now
 from evaluation import evaluate_model, multi_step_prediction, plot_multi_step_prediction
 
-# Modified function signature - removed data_path, added eval_duration
+# Removed data_path from signature, added eval_duration
 def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
                         model_path=config.MODEL_BEST_PATH,
                         limit_prediction_steps=None,
                         eval_duration=20.0 # Duration for the test segment
-                        # scenarios_to_eval and ics_to_eval removed
+                        # Removed scenarios_to_eval, ics_to_eval
                         ):
     """
     Loads the best saved model state and evaluates its multi-step prediction
@@ -40,6 +42,10 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
     else: device = torch.device("cpu")
     print(f"Using device: {device}")
 
+    # --- Data Generation Fallback (No longer loads external file for main eval data) ---
+    # We will generate a specific segment later for evaluation.
+    # We only need scalers.
+
     # --- Load Model Info (to determine type/params) ---
     # ... (Logic remains the same) ...
     model_info = None; model_type_for_eval = config.MODEL_TYPE; loaded_params = {}
@@ -52,6 +58,7 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
             print(f"  Loaded Params: { {k:v for k,v in loaded_params.items() if v is not None and v != 'unknown'} }")
         except Exception as e: print(f"Warning: Could not load model info file {model_info_path}. Error: {e}"); model_info = None
     else: print(f"Warning: Model info file {model_info_path} not found.")
+
 
     # --- Load Scalers ---
     # ... (Logic remains the same - determines expected paths based on model_type_for_eval and USE_SINCOS_THETA) ...
@@ -113,10 +120,12 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
         print(f"Successfully loaded model state from '{model_path}' to {device}")
     except Exception as e: print(f"Error during model setup: {e}"); return
 
-    # --- Perform Evaluation ---
+    # --- Perform Evaluation (Single Segment) ---
     print("\n--- Multi-Step Prediction Evaluation (on newly generated segment) ---")
     eval_start_time = time.time()
     predicted_states, true_states, physics_predictions = None, None, None
+    model_mse = np.nan # Initialize MSE
+
     try:
         # Generate a short segment with random IC and random torque for evaluation
         pendulum = PendulumSystem() # Initialize pendulum
@@ -124,13 +133,11 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
         print(f"Generating evaluation segment: duration={eval_duration}s, IC={np.round(eval_x0, 2)}, torque={config.TORQUE_TYPE}")
         df_eval_segment = generate_simulation_data(pendulum, t_span=(0, eval_duration), dt=config.DT, x0=eval_x0, torque_type=config.TORQUE_TYPE)
 
-        # Check if enough data generated and prepare sequences
         if not df_eval_segment.empty and len(df_eval_segment) > config.INPUT_SEQ_LEN + config.OUTPUT_SEQ_LEN:
             eval_data_values = df_eval_segment[['theta', 'theta_dot', 'tau']].values
-            # Create sequences (absolute states for X) using the correct input/output lengths
-            # Pass the determined use_sincos_for_eval flag
+            # Create sequences using the correct feature engineering flag
             X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN,
-                                         predict_delta=False, use_sincos=use_sincos_for_eval)
+                                         predict_delta=False, use_sincos=use_sincos_for_eval) # Use inferred flag
 
             if len(X_eval) > 0:
                 # Check feature consistency before scaling
@@ -154,19 +161,28 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
                          input_scaler=input_scaler, target_scaler=target_scaler, device=device
                      )
 
-                     # Generate physics comparison for this segment
-                     if len(predicted_states) > 0:
-                           physics_pendulum_ref = PendulumSystem()
-                           physics_x0 = df_eval_segment.iloc[config.INPUT_SEQ_LEN][['theta', 'theta_dot']].values
-                           physics_time_eval = df_for_pred_eval['time'].iloc[:prediction_steps_eval].values
-                           if len(physics_time_eval) > 0:
-                                physics_t_span = (physics_time_eval[0], physics_time_eval[-1]); physics_tau_values = df_for_pred_eval['tau'].iloc[:prediction_steps_eval].values
-                                physics_time, physics_theta, physics_theta_dot = run_simulation(physics_pendulum_ref, physics_t_span, config.DT, physics_x0, physics_tau_values, t_eval=physics_time_eval)
-                                if len(physics_time) == len(physics_time_eval): physics_predictions = np.stack([physics_theta, physics_theta_dot], axis=1)
-                           # Plot
-                           plot_filename = f"multistep_eval_{model_type_for_eval}"
-                           plot_multi_step_prediction(physics_time_eval, true_states, predicted_states, physics_predictions, f"{model_type_for_eval} (Eval)", config.FIGURES_DIR, filename_base=plot_filename)
-                           print(f"Multi-step prediction plot (Evaluation Segment) saved to {config.FIGURES_DIR}/{plot_filename}.png")
+                     # Calculate MSE if prediction successful
+                     if len(predicted_states) > 0 and len(true_states) == len(predicted_states):
+                         model_mse = np.mean((predicted_states - true_states)**2)
+                         print(f"  Multi-step MSE (Evaluation Segment): {model_mse:.6f}")
+
+                         # Generate physics comparison for this segment
+                         print("  Generating physics comparison...")
+                         try:
+                             physics_pendulum_ref = PendulumSystem()
+                             physics_x0 = df_eval_segment.iloc[config.INPUT_SEQ_LEN][['theta', 'theta_dot']].values
+                             physics_time_eval = df_for_pred_eval['time'].iloc[:prediction_steps_eval].values
+                             if len(physics_time_eval) > 0:
+                                 physics_t_span=(physics_time_eval[0], physics_time_eval[-1]); physics_tau_values=df_for_pred_eval['tau'].iloc[:prediction_steps_eval].values
+                                 physics_time, physics_theta, physics_theta_dot = run_simulation(physics_pendulum_ref, physics_t_span, config.DT, physics_x0, physics_tau_values, t_eval=physics_time_eval)
+                                 if len(physics_time) == len(physics_time_eval): physics_predictions = np.stack([physics_theta, physics_theta_dot], axis=1)
+                         except Exception as phys_e: print(f"  Error generating physics comparison: {phys_e}")
+
+                         # Plot
+                         plot_filename = f"multistep_eval_{model_type_for_eval}"
+                         plot_multi_step_prediction(physics_time_eval, true_states, predicted_states, physics_predictions, f"{model_type_for_eval} (Eval)", config.FIGURES_DIR, filename_base=plot_filename)
+                         print(f"  Multi-step prediction plot saved to {config.FIGURES_DIR}/{plot_filename}.png")
+
                 else: print(f"评估段可用步数 ({prediction_steps_eval}) 不足。")
             else: print("无法为评估段创建序列。")
         else: print("无法生成用于多步预测评估的数据段。")
@@ -185,24 +201,24 @@ if __name__ == "__main__":
     evaluate_model_type = config.MODEL_TYPE
     eval_model_basename = f'pendulum_{evaluate_model_type.lower()}'
     # Determine if the model likely used sin/cos features based on current config for path construction
-    if config.USE_SINCOS_THETA: eval_model_basename += "_sincos"
+    use_sincos_in_name = config.USE_SINCOS_THETA # Assume matches config for path finding
+    if use_sincos_in_name: eval_model_basename += "_sincos"
     eval_model_info_path = os.path.join(config.MODELS_DIR, f'{eval_model_basename}_final.pth')
     eval_model_path = os.path.join(config.MODELS_DIR, f'{eval_model_basename}_best.pth')
     # Data path is mostly for fallback generation context now
     eval_data_path_context = config.COMBINED_DATA_FILE # Path for fallback generation if needed
 
-    print(f"--- Evaluating Model Type: {evaluate_model_type} ---")
+    print(f"--- Evaluating Model Type: {evaluate_model_type} (Use SinCos: {use_sincos_in_name}) ---")
     print(f"Using Best Model State: {eval_model_path}")
     print(f"Using Final Model Info: {eval_model_info_path}")
-    # print(f"Base Data File (for context/fallback): {eval_data_path}") # Less relevant now
+    # print(f"Base Data File (for context/fallback): {eval_data_path_context}")
     print(f"Prediction Step Limit: {limit_steps if limit_steps else 'None'}")
 
-    # Call the evaluation function, removing the data_path argument
     evaluate_best_model(
         model_info_path=eval_model_info_path,
         model_path=eval_model_path,
-        # data_path=eval_data_path_context, # <<<--- REMOVE THIS ARGUMENT ---<<<
-        limit_prediction_steps=limit_steps,
-        # scenarios_to_eval and ics_to_eval removed as we generate one random segment
+        # data_path argument removed from function definition
+        limit_prediction_steps=limit_steps
+        # scenarios_to_eval and ics_to_eval removed
     )
 
