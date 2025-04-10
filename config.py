@@ -1,62 +1,95 @@
 # config.py
 
 """
-Configuration settings for the Pendulum LSTM experiment.
+Configuration settings for the Pendulum LSTM/GRU experiment.
+Using separate generation for Train and Validation sets.
 """
 
 import numpy as np
+import os
 
-# --- Simulation Parameters ---
-PENDULUM_MASS = 1.0       # kg
-PENDULUM_LENGTH = 1.0     # m
-GRAVITY = 9.81            # m/s^2
-DAMPING_COEFF = 0.5       # N·m·s/rad
-DT = 0.02                 # s (Simulation time step)
-T_SPAN = (0, 100)         # (start_time, end_time) in seconds for simulation
-# Define multiple initial conditions for diverse data
-INITIAL_CONDITIONS = [
-    [0.1, 0.0],
-    [-0.2, 0.1],
-    [0.5, -0.2],
-    [1.0, 0.0],
-    [-1.0, 0.5]
-]
-TORQUE_TYPE = "mixed"     # Type of torque sequence for simulation
+# --- Model Selection ---
+# Options: "PureLSTM", "PureGRU", "DeltaLSTM", "DeltaGRU"
+MODEL_TYPE = "DeltaGRU" # Keep DeltaGRU for now, can be changed
 
-# --- Data Handling ---
-DATA_FILE_EXTENDED = 'simulation_data_extended.csv' # File to save/load generated data
-FORCE_REGENERATE_DATA = False # Set to True to force data regeneration even if file exists
-MODELS_DIR = 'models'     # Directory to save models and scalers
-FIGURES_DIR = 'figures'   # Directory to save plots
-PLOT_SAMPLE_DATA = True   # Whether to plot a sample of the generated data
-
-# --- Preprocessing Parameters ---
-SEQUENCE_LENGTH = 20      # Number of time steps in each input sequence
-TEST_SPLIT = 0.2          # Proportion of data to use for the test set (0.0 to 1.0)
-
-# --- Model Hyperparameters ---
-HIDDEN_SIZE = 128         # Number of units in LSTM hidden layers
-NUM_LAYERS = 3            # Number of LSTM layers
-DENSE_UNITS = 96          # Number of units in the intermediate dense layer
-DROPOUT_RATE = 0.25       # Dropout probability
+# --- Model Architecture Parameters ---
+# Using dictionary structure
+MODEL_PARAMS = {
+    "defaults": { "dense_units": 64, "dropout_rate": 0.35 },
+    "purelstm": { "hidden_size": 96, "num_layers": 2 },
+    "puregru":  { "hidden_size": 96, "num_layers": 2 },
+    "deltalstm":{ "hidden_size": 96, "num_layers": 2 },
+    "deltagru": { "hidden_size": 96, "num_layers": 2 }
+}
+def get_current_model_params():
+    model_type_key = MODEL_TYPE.lower()
+    params = MODEL_PARAMS.get("defaults", {}).copy()
+    base_type_key = model_type_key.replace("delta", "pure", 1) if model_type_key.startswith("delta") else model_type_key
+    specific_params = MODEL_PARAMS.get(base_type_key)
+    if specific_params is None: raise ValueError(f"Params for '{MODEL_TYPE}'/'{base_type_key}' not found.")
+    params.update(specific_params)
+    print(f"Info: Using parameters from '{base_type_key}' definition for model '{MODEL_TYPE}'.")
+    return params
 
 # --- Training Hyperparameters ---
-NUM_EPOCHS = 150          # Maximum number of training epochs
-LEARNING_RATE = 0.0005    # Initial learning rate (Lowered based on previous results)
-WEIGHT_DECAY = 1e-5       # L2 regularization strength
-BATCH_SIZE = 128          # Number of samples per training batch (defined in preprocessing/training)
-EARLY_STOPPING_PATIENCE = 15 # Number of epochs to wait for improvement before stopping
-SCHEDULER_FACTOR = 0.4    # Factor by which the learning rate will be reduced
-SCHEDULER_PATIENCE = 7    # Number of epochs with no improvement after which learning rate will be reduced
+NUM_EPOCHS = 150
+LEARNING_RATE = 0.0002
+WEIGHT_DECAY = 1e-5
+BATCH_SIZE = 128
+EARLY_STOPPING_PATIENCE = 20
+SCHEDULER_FACTOR = 0.5
+SCHEDULER_PATIENCE = 8
 
-# --- Evaluation Parameters ---
-MIN_PREDICTION_STEPS = 50 # Minimum number of steps required to run multi-step prediction plot
+# --- Simulation Parameters ---
+PENDULUM_MASS = 1.0
+PENDULUM_LENGTH = 1.0
+GRAVITY = 9.81
+DAMPING_COEFF = 0.5
+DT = 0.02
+
+# Define specific Initial Conditions (ICs)
+INITIAL_CONDITIONS_SPECIFIC = [
+    [0.0, 0.0],         # 1. Static (or near static)
+    [0.3, -0.5],        # 2. Low Amplitude, Falling Right
+    [-0.3, 0.5],        # 3. Low Amplitude, Rising Left
+    [-1.0, -1.0],       # 4. High Amplitude, Falling Left
+    [1.0, 1.0]          # 5. High Amplitude, Rising Right
+]
+# Define Torque Scenarios
+SCENARIOS = ["zero", "step", "sine", "random", "mixed"]
+
+# Define different simulation durations for train and validation
+T_SPAN_TRAIN = (0, 40)  # Longer duration for training data (e.g., 40 seconds per segment)
+T_SPAN_VAL = (0, 10)    # Shorter duration for validation data (e.g., 10 seconds per segment)
+
+# --- Data Handling ---
+# Define separate file paths for train and validation data
+TRAIN_DATA_FILE = 'train_data_sep.csv'
+VAL_DATA_FILE = 'validation_data_sep.csv'
+# DATA_FILE_EXTENDED is no longer the primary source for training/validation split
+FORCE_REGENERATE_DATA = False # Still useful to control regeneration
+MODELS_DIR = 'models'
+FIGURES_DIR = 'figures'
+PLOT_SCENARIO_DATA = True # Flag to plot individual generated scenarios
+
+# --- Preprocessing Parameters ---
+SEQUENCE_LENGTH = 20
+# VALIDATION_SPLIT is no longer needed as we generate sets separately
+MIN_PREDICTION_STEPS = 50
 
 # --- Paths ---
-MODEL_BEST_PATH = f'{MODELS_DIR}/pendulum_lstm_best.pth'
-MODEL_FINAL_PATH = f'{MODELS_DIR}/pendulum_lstm_final.pth'
-INPUT_SCALER_PATH = f'{MODELS_DIR}/input_scaler.pkl'
-OUTPUT_SCALER_PATH = f'{MODELS_DIR}/output_scaler.pkl'
+MODEL_BASENAME = f'pendulum_{MODEL_TYPE.lower()}'
+MODEL_BEST_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_best.pth')
+MODEL_FINAL_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_final.pth')
+
+# Scaler paths and type determination remains the same
+if MODEL_TYPE.lower().startswith("delta"):
+    TARGET_SCALER_PATH = os.path.join(MODELS_DIR, 'delta_scaler.pkl')
+    TARGET_SCALER_TYPE = "StandardScaler"
+else:
+    TARGET_SCALER_PATH = os.path.join(MODELS_DIR, 'output_scaler.pkl')
+    TARGET_SCALER_TYPE = "MinMaxScaler"
+INPUT_SCALER_PATH = os.path.join(MODELS_DIR, 'input_scaler.pkl')
 
 # --- Misc ---
-SEED = 42                 # Random seed for reproducibility
+SEED = 42
