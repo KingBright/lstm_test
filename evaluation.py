@@ -44,20 +44,53 @@ def evaluate_model(model, data_loader, criterion, device=None):
         if torch.backends.mps.is_available(): device = torch.device("mps")
         elif torch.cuda.is_available(): device = torch.device("cuda")
         else: device = torch.device("cpu")
-    model.to(device); model.eval(); total_loss = 0.0; batches = 0; start_time = time.time()
-    if data_loader is None: print("Warning: data_loader is None in evaluate_model."); return float('inf')
-    try: loader_len = len(data_loader.dataset) if hasattr(data_loader, 'dataset') else len(data_loader);
-    except (TypeError, AttributeError): loader_len = 0
-    if loader_len == 0 and hasattr(data_loader, 'dataset'): print("Warning: Evaluation dataset is empty."); return float('inf')
+    model.to(device)
+    model.eval()
+    total_loss = 0.0
+    batches = 0
+    start_time = time.time()
+    
+    if data_loader is None:
+        print("警告: evaluate_model中data_loader为None。")
+        return float('inf')
+        
+    try:
+        loader_len = len(data_loader.dataset) if hasattr(data_loader, 'dataset') else len(data_loader)
+    except (TypeError, AttributeError):
+        loader_len = 0
+        
+    if loader_len == 0 and hasattr(data_loader, 'dataset'):
+        print("警告: 评估数据集为空。")
+        return float('inf')
+        
+    # 使用torch.no_grad()减少内存使用并提高评估速度
     with torch.no_grad():
-        for inputs, targets in data_loader: # targets shape: (batch, K, output_size)
-            inputs, targets = inputs.to(device), targets.to(device)
-            try: outputs = model(inputs) # outputs shape: (batch, K, output_size)
-            except Exception as e: print(f"Error during model evaluation forward pass: {e}"); return float('inf')
-            loss = criterion(outputs, targets) # MSELoss compares element-wise
-            if not torch.isfinite(loss): print("Warning: NaN or Inf loss detected."); return float('inf')
-            total_loss += loss.item(); batches += 1
-    avg_loss = total_loss / batches if batches > 0 else float('inf'); eval_time = time.time() - start_time
+        for inputs, targets in data_loader:  # targets shape: (batch, K, output_size)
+            # 使用non_blocking=True加速内存传输 (对MPS尤其有效)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            
+            try:
+                outputs = model(inputs)  # outputs shape: (batch, K, output_size)
+            except Exception as e:
+                print(f"模型评估前向传播时出错: {e}")
+                return float('inf')
+                
+            loss = criterion(outputs, targets)  # MSELoss逐元素比较
+            
+            if not torch.isfinite(loss):
+                print("警告: 检测到NaN或Inf损失。")
+                return float('inf')
+                
+            total_loss += loss.item()
+            batches += 1
+    
+    # 同步MPS设备 (如果使用)，确保所有操作完成
+    if device.type == 'mps':
+        torch.mps.synchronize()
+        
+    avg_loss = total_loss / batches if batches > 0 else float('inf')
+    eval_time = time.time() - start_time
     if np.isfinite(avg_loss): print(f'Average Validation/Test Loss (MSE): {avg_loss:.6f}, Evaluation Time: {eval_time:.2f}s')
     else: print(f'Evaluation resulted in invalid average loss. Time: {eval_time:.2f}s')
     return avg_loss
@@ -117,46 +150,99 @@ def multi_step_prediction(model, initial_sequence, df_pred,
 
     print(f"运行 Seq2Seq 多步预测，共 {prediction_steps} 步...")
     with torch.no_grad():
-        for i in range(prediction_steps):
-            current_sequence_tensor = torch.tensor(
-                current_sequence_np.reshape(1, input_seq_len, num_input_features),
-                dtype=torch.float32
-            ).to(device)
+        # 针对M2 Max优化的多步预测
+        # 使用批处理方式预测多个时间步，减少设备同步次数
+        batch_size = min(20, prediction_steps)  # 每批处理的步数，根据内存调整
+        num_batches = (prediction_steps + batch_size - 1) // batch_size
+        
+        # 预先分配结果列表
+        predicted_states_list = []
+        
+        for batch_idx in range(num_batches):
+            # 确定当前批次要处理的步数
+            start_step = batch_idx * batch_size
+            end_step = min(prediction_steps, (batch_idx + 1) * batch_size)
+            current_batch_steps = end_step - start_step
+            
+            if start_step >= prediction_steps:
+                break
+                
+            # 每一步循环处理
+            for i in range(start_step, end_step):
+                # 将当前序列转换为张量并发送到设备
+                current_sequence_tensor = torch.tensor(
+                    current_sequence_np.reshape(1, input_seq_len, num_input_features),
+                    dtype=torch.float32
+                ).to(device, non_blocking=True)  # 使用non_blocking=True加速传输
 
-            # --- 预测 (模型输出 K 步) ---
-            try:
-                # model_output_scaled shape: (1, K, output_size)
-                model_output_scaled_sequence = model(current_sequence_tensor).cpu().numpy()[0]
-                if not np.all(np.isfinite(model_output_scaled_sequence)): print(f"NaN/Inf detected at step {i}. Stopping."); break
-                # 只取预测的 K 步中的第一步来前滚
-                next_step_output_scaled = model_output_scaled_sequence[0, :] # Shape: (output_size,)
-            except Exception as e: print(f"模型前向传播错误 step {i}: {e}"); break
+                # --- 预测 (模型输出 K 步) ---
+                try:
+                    # 获取模型输出 (仅在批次结束时同步到CPU)
+                    model_output = model(current_sequence_tensor)
+                    
+                    # 仅在需要时同步到CPU (最后一步或出现问题时)
+                    if i == end_step - 1 or not torch.all(torch.isfinite(model_output)):
+                        # 同步MPS设备 (如果使用)
+                        if device.type == 'mps':
+                            torch.mps.synchronize()
+                            
+                        model_output_scaled_sequence = model_output.cpu().numpy()[0]
+                        
+                        if not np.all(np.isfinite(model_output_scaled_sequence)):
+                            print(f"在步骤 {i} 检测到 NaN/Inf。停止预测。")
+                            break
+                            
+                        # 只取预测的 K 步中的第一步来前滚
+                        next_step_output_scaled = model_output_scaled_sequence[0, :]  # Shape: (output_size,)
+                    else:
+                        # 直接从GPU获取第一步预测并转换为numpy
+                        next_step_output_scaled = model_output[0, 0].cpu().numpy()
+                        
+                except Exception as e:
+                    print(f"模型前向传播错误，步骤 {i}: {e}")
+                    # 同步MPS设备以确保所有操作完成
+                    if device.type == 'mps':
+                        torch.mps.synchronize()
+                    break
 
-            # --- 状态更新 (反标准化预测的第一步) ---
-            try:
-                current_state_unscaled = target_scaler.inverse_transform(next_step_output_scaled.reshape(1, -1))[0]
-                predicted_states_list.append(current_state_unscaled) # 存储预测的 state(t+1)
-            except Exception as e: print(f"状态反标准化错误 step {i}: {e}"); break
+                # --- 状态更新 (反标准化预测的第一步) ---
+                try:
+                    current_state_unscaled = target_scaler.inverse_transform(next_step_output_scaled.reshape(1, -1))[0]
+                    predicted_states_list.append(current_state_unscaled) # 存储预测的 state(t+1)
+                except Exception as e:
+                    print(f"状态反标准化错误，步骤 {i}: {e}")
+                    break
 
-            # --- 准备下一步的输入 ---
-            # 使用预测出的 state(t+1) 和已知的 tau(t+1) 来构建输入序列的最后一步
-            try:
-                # 需要 t+1 时刻的 tau (在 df_pred 的索引 i 处)
-                next_tau_original = df_pred.iloc[i]['tau']
-                # 处理 sin/cos 特征 (如果启用)
-                pred_theta, pred_theta_dot = current_state_unscaled[0], current_state_unscaled[1]
-                if config.USE_SINCOS_THETA:
-                     next_input_features_unscaled = np.array([np.sin(pred_theta), np.cos(pred_theta), pred_theta_dot, next_tau_original])
-                else:
-                     next_input_features_unscaled = np.array([pred_theta, pred_theta_dot, next_tau_original])
-                # 标准化这个新的特征向量
-                next_step_features_scaled = input_scaler.transform(next_input_features_unscaled.reshape(1, -1))[0]
-            except IndexError: print(f"警告: 在 df_pred 中找不到 tau 输入 step {i}. 停止。"); break
-            except Exception as e: print(f"准备下一步输入时出错 step {i}: {e}"); break
+                # --- 准备下一步的输入 ---
+                # 使用预测出的 state(t+1) 和已知的 tau(t+1) 来构建输入序列的最后一步
+                try:
+                    # 需要 t+1 时刻的 tau (在 df_pred 的索引 i 处)
+                    next_tau_original = df_pred.iloc[i]['tau']
+                    
+                    # 处理 sin/cos 特征 (如果启用)
+                    pred_theta, pred_theta_dot = current_state_unscaled[0], current_state_unscaled[1]
+                    if config.USE_SINCOS_THETA:
+                         next_input_features_unscaled = np.array([np.sin(pred_theta), np.cos(pred_theta), pred_theta_dot, next_tau_original])
+                    else:
+                         next_input_features_unscaled = np.array([pred_theta, pred_theta_dot, next_tau_original])
+                         
+                    # 标准化这个新的特征向量
+                    next_step_features_scaled = input_scaler.transform(next_input_features_unscaled.reshape(1, -1))[0]
+                except IndexError:
+                    print(f"警告: 在 df_pred 中找不到 tau 输入，步骤 {i}。停止预测。")
+                    break
+                except Exception as e:
+                    print(f"准备下一步输入时出错，步骤 {i}: {e}")
+                    break
 
-            # 更新序列: 去掉最旧的一步, 加入最新的一步
-            current_sequence_np = np.append(current_sequence_np[1:], next_step_features_scaled.reshape(1, -1), axis=0)
-            # 循环结束
+                # 更新序列: 去掉最旧的一步, 加入最新的一步
+                current_sequence_np = np.append(current_sequence_np[1:], next_step_features_scaled.reshape(1, -1), axis=0)
+            
+            # 在批次结束时同步MPS设备
+            if device.type == 'mps':
+                torch.mps.synchronize()
+                
+            # 批处理循环结束
 
     # --- 处理结果 ---
     actual_prediction_steps = len(predicted_states_list)

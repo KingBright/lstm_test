@@ -132,17 +132,57 @@ def prepare_timesplit_seq2seq_data(df_all, input_sequence_length=config.INPUT_SE
     y_train_scaled = y_train_scaled_reshaped.reshape(y_train.shape)
     y_val_scaled = y_val_scaled_reshaped.reshape(y_val.shape) if y_val.shape[0] > 0 else np.empty((0, output_sequence_length, num_output_features))
 
-    # --- Create Tensors and DataLoaders ---
+    # --- Create Tensors and DataLoaders (针对M2 Max优化) ---
     try:
-        X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32); y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32)
-        X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32); y_val_tensor = torch.tensor(y_val_scaled, dtype=torch.float32)
+        # 创建张量
+        X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32)
+        X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32)
+        y_val_tensor = torch.tensor(y_val_scaled, dtype=torch.float32)
+        
+        # 创建数据集
         train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
         val_dataset = TensorDataset(X_val_tensor, y_val_tensor) if X_val_tensor.shape[0] > 0 else None
-        train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2, persistent_workers=True)
-        val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=2, persistent_workers=False) if val_dataset else None
-        print("DataLoaders created.")
-        if val_loader is None: print("Warning: Validation DataLoader is None.")
-    except Exception as e: print(f"Error creating Tensors or DataLoaders: {e}"); return (None, None, input_scaler, target_scaler)
+        
+        # 检测CPU核心数以优化num_workers
+        import multiprocessing
+        num_workers = min(4, max(2, multiprocessing.cpu_count() // 2))  # 使用一半的CPU核心数，但至少2个，最多4个
+        print(f"使用 {num_workers} 个工作进程加载数据")
+        
+        # 针对M2 Max优化的DataLoader参数
+        # - pin_memory=True: 加速CPU到GPU的数据传输
+        # - persistent_workers=True: 保持工作进程活跃，减少创建/销毁开销
+        # - prefetch_factor=2: 每个工作进程预取的批次数
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=config.BATCH_SIZE,
+            shuffle=True, 
+            pin_memory=True,
+            num_workers=num_workers,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+        
+        # 验证集dataloader (如果有验证集)
+        if val_dataset:
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=config.BATCH_SIZE * 2,  # 验证时可使用更大批次
+                shuffle=False, 
+                pin_memory=True,
+                num_workers=num_workers,
+                persistent_workers=True,
+                prefetch_factor=2,
+            )
+        else:
+            val_loader = None
+            
+        print(f"DataLoaders创建完成! 训练批次: {len(train_loader)}, 验证批次: {len(val_loader) if val_loader else 0}")
+        if val_loader is None:
+            print("警告: 验证DataLoader为空。")
+    except Exception as e:
+        print(f"创建Tensors或DataLoaders时出错: {e}")
+        return (None, None, input_scaler, target_scaler)
 
     return train_loader, val_loader, input_scaler, target_scaler
 

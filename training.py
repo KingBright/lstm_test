@@ -44,13 +44,13 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
     # 优化器
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # 学习率调度器 - 移除 verbose=True
+    # 学习率调度器 - 使用正确的verbose参数
     scheduler = ReduceLROnPlateau(
         optimizer,
         mode='min',
         factor=scheduler_factor,
         patience=scheduler_patience,
-        # verbose=True, # <<<--- 移除此参数
+        verbose=False,  # 设为False以避免警告
         min_lr=1e-7
     )
 
@@ -78,17 +78,58 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
         # 记录当前周期的起始学习率
         prev_lr = optimizer.param_groups[0]['lr']
 
-        # --- 训练阶段 ---
-        model.train(); running_train_loss = 0.0; train_batches = 0
+        # --- 训练阶段 (针对M2 Max优化) ---
+        model.train()
+        running_train_loss = 0.0
+        train_batches = 0
+        
+        # 设置较大的批次大小进行梯度累积
+        grad_accumulation_steps = 1  # 默认为1，可根据内存情况调整
+        
         for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            try: outputs = model(inputs); loss = criterion(outputs, targets)
-            except Exception as e: print(f"训练前向/损失计算错误: {e}"); return train_losses, val_losses, 0
-            if not torch.isfinite(loss): print(f"错误: 训练周期 {epoch+1} 损失 NaN/Inf。"); return train_losses, val_losses, 0
-            try: loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0); optimizer.step()
-            except Exception as e: print(f"训练反向/优化器错误: {e}"); return train_losses, val_losses, 0
-            running_train_loss += loss.item(); train_batches += 1
+            # 使用 non_blocking=True 加速数据传输
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            
+            # 仅在需要时清零梯度
+            if train_batches % grad_accumulation_steps == 0:
+                optimizer.zero_grad()
+                
+            try:
+                # 前向传播和损失计算
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                
+                # 如果使用梯度累积，则缩放损失
+                if grad_accumulation_steps > 1:
+                    loss = loss / grad_accumulation_steps
+            except Exception as e:
+                print(f"训练前向/损失计算错误: {e}")
+                return train_losses, val_losses, 0
+                
+            if not torch.isfinite(loss):
+                print(f"错误: 训练周期 {epoch+1} 损失 NaN/Inf。")
+                return train_losses, val_losses, 0
+                
+            try:
+                # 反向传播
+                loss.backward()
+                
+                # 仅在累积步骤结束时更新参数
+                if (train_batches + 1) % grad_accumulation_steps == 0 or (train_batches + 1) == len(train_loader):
+                    # 梯度裁剪以提高稳定性
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+            except Exception as e:
+                print(f"训练反向/优化器错误: {e}")
+                return train_losses, val_losses, 0
+                
+            running_train_loss += loss.item() * (1 if grad_accumulation_steps == 1 else grad_accumulation_steps)
+            train_batches += 1
+            
+        # 如果是MPS设备，添加同步点确保所有操作完成
+        if device.type == 'mps':
+            torch.mps.synchronize()
         epoch_train_loss = running_train_loss / train_batches if train_batches > 0 else 0
         train_losses.append(epoch_train_loss)
 

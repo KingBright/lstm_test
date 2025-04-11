@@ -41,24 +41,33 @@ EARLY_STOPPING_PATIENCE = 20; SCHEDULER_FACTOR = 0.5; SCHEDULER_PATIENCE = 8
 # --- Simulation Parameters ---
 PENDULUM_MASS = 1.0; PENDULUM_LENGTH = 1.0; GRAVITY = 9.81; DAMPING_COEFF = 0.5
 DT = 0.02
-# Use specific ICs to start simulations
+# 基础特定初始条件
 INITIAL_CONDITIONS_SPECIFIC = [
     [0.0, 0.0], [0.3, -0.5], [-0.3, 0.5], [-1.0, -1.0], [1.0, 1.0]
 ]
-NUM_ICS_TO_RUN = len(INITIAL_CONDITIONS_SPECIFIC) # Number of long simulations
 
-# Torque Scenario - Use only highly random for long runs
+# 优化的数据生成策略参数
+# 目标序列总数约100,000
+TARGET_SEQUENCES = 100000
+# 角度和角速度范围参数 (用于随机初始条件)
+THETA_RANGE = [-np.pi/2, np.pi/2]  # 角度范围 [-90°, 90°]
+THETA_DOT_RANGE = [-2.0, 2.0]      # 角速度范围 [-2, 2] rad/s
+# 随机初始条件数量 (将会根据目标序列数自动计算)
+NUM_RANDOM_ICS = 500  # 默认值，会根据总序列需求自动调整
+
+# Torque 参数设置
 TORQUE_TYPE = "highly_random"
-TORQUE_RANGE = [-0.7, 0.7] # Keep gentler random torque
-TORQUE_CHANGE_STEPS = 20
+TORQUE_RANGE = [-0.7, 0.7]  # 力矩范围
+# 力矩变化步长范围 (随机选择)
+TORQUE_CHANGE_STEPS_RANGE = [10, 30]  # 在每次模拟时随机选择力矩变化步长
 
-# Simulation Duration - Generate fewer, longer simulations
-SIMULATION_DURATION_LONG = 100.0 # <<<--- 每个长仿真的时长 (例如 100 秒)
-T_SPAN_LONG = (0, SIMULATION_DURATION_LONG) # <<<--- 定义长时段
+# 优化的模拟时长设置
+SIMULATION_DURATION = 30.0  # 每个模拟的时长减少到30秒
+T_SPAN = (0, SIMULATION_DURATION)  # 定义模拟时间段
 
 # --- Data Handling ---
-# Combined data file from long simulations
-COMBINED_DATA_FILE = f'combined_long_{MODEL_TYPE.lower().replace("seq2seq","")}{"_sincos" if USE_SINCOS_THETA else ""}.csv'
+# Combined data file from optimized training data
+COMBINED_DATA_FILE = f'combined_optimized_{MODEL_TYPE.lower().replace("seq2seq","")}{"_sincos" if USE_SINCOS_THETA else ""}.csv'
 FORCE_REGENERATE_DATA = False
 MODELS_DIR = 'models'; FIGURES_DIR = 'figures'
 PLOT_SCENARIO_DATA = False # Plotting individual scenarios less relevant now
@@ -74,11 +83,10 @@ TARGET_SCALER_TYPE = "MinMaxScaler" # For Seq2Seq absolute state
 # --- Paths ---
 MODEL_BASENAME = f'pendulum_{MODEL_TYPE.lower()}'
 if USE_SINCOS_THETA: MODEL_BASENAME += "_sincos"
-MODEL_BASENAME += "_longtraj" # Add indicator for long trajectory data
+MODEL_BASENAME += "_optimized" # 更改标识符以反映优化的数据生成策略
 MODEL_BEST_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_best.pth')
 MODEL_FINAL_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_final.pth')
 
-# Target Scaler paths and type determination remains the same
 if MODEL_TYPE.lower().startswith("delta"): TARGET_SCALER_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_delta_scaler.pkl')
 else: TARGET_SCALER_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_output_scaler.pkl')
 INPUT_SCALER_FILENAME = f'{MODEL_BASENAME}_input_scaler.pkl'

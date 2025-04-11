@@ -13,9 +13,48 @@ import config # Import config for default parameters
 # from scipy.integrate import solve_ivp
 # from data_generation import PendulumSystem
 
-# --- setup_logging_and_warnings function (保持不变) ---
+# --- M2 Max优化环境设置 (新函数) ---
+def setup_m2_max_environment():
+    """设置针对Apple M2 Max的PyTorch环境优化变量"""
+    import torch
+    if torch.backends.mps.is_available():
+        try:
+            # 设置环境变量优化Metal性能
+            os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+            
+            # 禁用不必要的警告
+            os.environ['TORCH_WARN_ALWAYS_UNSAFE_USAGE'] = '0'
+            
+            # 设置MPS缓存限制 (实验性设置，根据可用内存调整)
+            # os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'  # 防止MPS后端过度分配内存
+            
+            # 设置并行工作线程数
+            import multiprocessing
+            num_cores = multiprocessing.cpu_count()
+            os.environ['OMP_NUM_THREADS'] = str(min(num_cores, 6))  # 限制OpenMP线程数
+            os.environ['MKL_NUM_THREADS'] = str(min(num_cores, 6))  # 限制MKL线程数
+            
+            print(f"✓ M2 Max优化环境已配置 (MPS加速已启用, {num_cores} 核心可用)")
+            return True
+        except Exception as e:
+            print(f"! M2 Max环境设置时出错: {e}")
+            return False
+    return False
+
+# --- setup_logging_and_warnings function (改进版) ---
 def setup_logging_and_warnings():
-    warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib"); logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR); warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization"); os.environ['TORCH_WARN_ALWAYS_UNSAFE_USAGE'] = '0'; # print("Logging and warnings configured.")
+    """配置日志和警告过滤，同时设置M2 Max优化环境"""
+    # 设置警告过滤
+    warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization")
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
+    
+    # 设置环境变量
+    os.environ['TORCH_WARN_ALWAYS_UNSAFE_USAGE'] = '0'
+    
+    # 设置M2 Max优化环境
+    setup_m2_max_environment()
 
 # --- safe_text function (保持不变) ---
 def safe_text(text, fallback_text=None):
