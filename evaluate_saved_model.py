@@ -137,7 +137,7 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
             eval_data_values = df_eval_segment[['theta', 'theta_dot', 'tau']].values
             # Create sequences using the correct feature engineering flag
             X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN,
-                                         predict_delta=False, use_sincos=use_sincos_for_eval) # Use inferred flag
+                                         use_sincos=use_sincos_for_eval) # Use inferred flag
 
             if len(X_eval) > 0:
                 # Check feature consistency before scaling
@@ -194,7 +194,8 @@ def evaluate_best_model(model_info_path=config.MODEL_FINAL_PATH,
 
 
 if __name__ == "__main__":
-    utils.setup_logging_and_warnings(); utils.setup_chinese_font()
+    utils.setup_logging_and_warnings()
+    utils.setup_chinese_font()
     # --- Configuration for Evaluation ---
     limit_steps = 1000 # Limit prediction length for speed
     # Specify which trained model to evaluate by setting its type from config

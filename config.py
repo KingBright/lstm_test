@@ -105,7 +105,7 @@ if MODEL_TYPE.lower().startswith("delta"): # Keep this logic, although we set Se
 else: # For Pure... or Seq2Seq... predicting absolute state
     TARGET_SCALER_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_output_scaler.pkl')
 
-INPUT_SCALER_FILENAME = f'{MODEL_BASENAME}_input_scaler{"_sincos" if USE_SINCOS_THETA else ""}.pkl'
+INPUT_SCALER_FILENAME = f'{MODEL_BASENAME}_input_scaler.pkl'
 INPUT_SCALER_PATH = os.path.join(MODELS_DIR, INPUT_SCALER_FILENAME)
 
 # --- Evaluation Parameters ---
