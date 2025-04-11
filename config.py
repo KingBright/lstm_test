@@ -14,7 +14,7 @@ USE_SINCOS_THETA = True # Keep using sin/cos features for input
 # --- Model Selection ---
 # Options: "PureLSTM", "PureGRU", "DeltaLSTM", "DeltaGRU", "Seq2SeqLSTM", "Seq2SeqGRU"
 # Let's define new types for Seq2Seq models
-MODEL_TYPE = "Seq2SeqGRU" # <<<--- NEW: Using GRU for Seq2Seq initially
+MODEL_TYPE = "Seq2SeqLSTM" # <<<--- NEW: Using GRU for Seq2Seq initially
 
 # --- Model Architecture Parameters ---
 # Parameters for the chosen MODEL_TYPE will be used.
@@ -32,7 +32,7 @@ MODEL_PARAMS = {
     "deltalstm":{ "hidden_size": 32, "num_layers": 2 },
     "deltagru": { "hidden_size": 32, "num_layers": 2 },
     # Add specific params for Seq2Seq if needed, otherwise they use base params
-    "seq2seqlstm":{ "hidden_size": 10, "num_layers": 2 },
+    "seq2seqlstm":{ "hidden_size": 32, "num_layers": 2 },
     "seq2seqgru": { "hidden_size": 10, "num_layers": 1 }
 }
 # Function to get parameters (remains the same, handles base types)
@@ -52,7 +52,7 @@ NUM_EPOCHS = 150 # Keep epoch count, let early stopping decide
 LEARNING_RATE = 0.0005 # May need adjustment for Seq2Seq, start slightly higher than last run
 WEIGHT_DECAY = 1e-5
 BATCH_SIZE = 128
-EARLY_STOPPING_PATIENCE = 20
+EARLY_STOPPING_PATIENCE = 40
 SCHEDULER_FACTOR = 0.5
 SCHEDULER_PATIENCE = 8
 
