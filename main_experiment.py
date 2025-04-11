@@ -11,7 +11,7 @@ from collections import defaultdict # To collect dataframes by scenario
 
 # Import necessary modules from the project
 import config
-import utils # Need utils for validation function and plotting
+import utils # Need utils for plotting
 # Import functions/classes from respective modules
 from data_generation import PendulumSystem, generate_simulation_data, run_simulation
 # Import the NEW shuffle-then-split data prep function and create_sequences
@@ -26,7 +26,7 @@ def run_experiment():
     Runs the complete workflow using highly randomized data generation,
     shuffle-then-split preprocessing (operating on list of DFs),
     Seq2Seq model training/evaluation.
-    Physics validation removed for now.
+    Physics validation removed.
     """
     start_time = time.time()
 
@@ -47,53 +47,63 @@ def run_experiment():
     gen_start_time = time.time()
     all_dfs = [] # <<<--- Store individual DataFrames in this list
     total_points = 0
+    df_combined_for_saving = None # Initialize
 
     # Check if combined file exists and regeneration is not forced (for potential loading in future)
-    # For now, we regenerate the list of dfs unless file exists AND we add loading logic for the list
     if os.path.exists(config.COMBINED_DATA_FILE) and not config.FORCE_REGENERATE_DATA:
-        # If loading, we currently don't reconstruct the list easily.
-        # So, for simplicity with the current prepare_shuffled_train_val_data expecting a list,
-        # we will regenerate the list of dfs if FORCE_REGENERATE_DATA is False but we need the list.
-        # A more robust implementation might save/load the list of DFs (e.g., using pickle).
-        print(f"找到合并数据文件 {config.COMBINED_DATA_FILE}，但当前流程需要重新生成数据列表。")
-        print("将生成新的随机数据...")
-        config.FORCE_REGENERATE_DATA = True # Force regeneration to get the list
+        print(f"加载已有的合并数据文件: {config.COMBINED_DATA_FILE}...")
+        try:
+            # Load the combined file first to get df_all for potential use/saving check
+            df_all_loaded = pd.read_csv(config.COMBINED_DATA_FILE)
+            total_points = len(df_all_loaded)
+            print(f"已加载 {total_points} 数据点。")
+            # IMPORTANT: We still need the list of DFs for prepare_shuffled_train_val_data
+            # If we load the combined file, we cannot easily reconstruct the list.
+            # Therefore, we will regenerate the list even if the file exists,
+            # unless a more complex loading/saving mechanism for the list is implemented.
+            print("警告: 找到合并文件，但当前流程需要重新生成 DataFrame 列表以进行预处理。将重新生成...")
+            config.FORCE_REGENERATE_DATA = True # Force regeneration to get the list
+        except Exception as e:
+            print(f"加载合并数据文件时出错: {e}. 将尝试重新生成。")
+            config.FORCE_REGENERATE_DATA = True
 
-    # Always generate if file doesn't exist or regeneration is forced
-    print(f"生成新的随机数据 (Force regenerate: {config.FORCE_REGENERATE_DATA})...")
-    print(f"将执行 {config.NUM_SIMULATIONS} 次短时仿真...")
-    for i in range(config.NUM_SIMULATIONS):
-        x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]
-        df_single = generate_simulation_data(pendulum, t_span=config.T_SPAN_SHORT, dt=config.DT, x0=x0, torque_type=config.TORQUE_TYPE)
-        # --- Physics validation REMOVED ---
-        if not df_single.empty:
-            all_dfs.append(df_single) # <<<--- Append individual df to the list
-            total_points += len(df_single)
-        if (i + 1) % 500 == 0: print(f"  已完成 {i+1}/{config.NUM_SIMULATIONS} 次仿真...")
+    # Generate new data if needed
+    if not all_dfs: # Check if list is empty (needs generation)
+        print(f"生成新的随机数据 (Force regenerate: {config.FORCE_REGENERATE_DATA})...")
+        print(f"将执行 {config.NUM_SIMULATIONS} 次短时仿真...")
+        for i in range(config.NUM_SIMULATIONS):
+            x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]
+            df_single = generate_simulation_data(pendulum, t_span=config.T_SPAN_SHORT, dt=config.DT, x0=x0, torque_type=config.TORQUE_TYPE)
+            # --- Physics validation REMOVED ---
+            if not df_single.empty:
+                all_dfs.append(df_single) # <<<--- Append individual df to the list
+                total_points += len(df_single)
+            if (i + 1) % 500 == 0: print(f"  已完成 {i+1}/{config.NUM_SIMULATIONS} 次仿真...")
 
-    if not all_dfs: print("Error: 未能成功生成任何仿真数据。"); return
+        if not all_dfs: print("Error: 未能成功生成任何仿真数据。"); return
 
-    print(f"所有仿真数据片段已生成，总数据点: {total_points}, 总片段数: {len(all_dfs)}")
+        print(f"所有仿真数据片段已生成，总数据点: {total_points}, 总片段数: {len(all_dfs)}")
 
-    # --- Optionally save the combined data (for evaluate_saved_model.py or inspection) ---
-    try:
-        df_combined_for_saving = pd.concat(all_dfs, ignore_index=True)
-        os.makedirs(config.MODELS_DIR, exist_ok=True)
-        df_combined_for_saving.to_csv(config.COMBINED_DATA_FILE, index=False)
-        print(f"合并后的数据已保存到 {config.COMBINED_DATA_FILE} (供参考或独立评估使用)")
-    except Exception as e: print(f"保存合并数据文件时出错: {e}")
+        # --- Optionally save the combined data (for evaluate_saved_model.py or inspection) ---
+        try:
+            df_combined_for_saving = pd.concat(all_dfs, ignore_index=True)
+            os.makedirs(config.MODELS_DIR, exist_ok=True)
+            df_combined_for_saving.to_csv(config.COMBINED_DATA_FILE, index=False)
+            print(f"合并后的数据已保存到 {config.COMBINED_DATA_FILE} (供参考或独立评估使用)")
+        except Exception as e: print(f"保存合并数据文件时出错: {e}")
 
     gen_time = time.time() - gen_start_time
     print(f"数据生成完成，耗时: {gen_time:.2f}秒")
+    if not all_dfs: print("数据生成失败，无法继续。"); return # Check if list is populated
 
-    # --- Physics Validation Step (REMOVED from combined data) ---
+    # --- Physics Validation Step REMOVED ---
 
     # --- Step 3: Prepare DataLoaders using Shuffle-then-Split ---
     print("\n步骤3: 创建序列，打乱并分割训练/验证集...")
     data_prep_start_time = time.time()
     # --- VVVVVV 调用新的数据准备函数，并传递 DataFrame 列表 VVVVVV ---
     data_loaders_tuple = prepare_shuffled_train_val_data(
-        all_dfs, # <<<--- 传递 DataFrame 列表
+        all_dfs, # <<<--- 传递 DataFrame 列表 all_dfs
         sequence_length=config.INPUT_SEQ_LEN,
         output_sequence_length=config.OUTPUT_SEQ_LEN,
         val_fraction=config.VAL_SET_FRACTION,
@@ -111,10 +121,14 @@ def run_experiment():
 
     # --- Step 4: Model Definition ---
     # ... (Model definition logic remains the same) ...
-    try: input_size = 4 if config.USE_SINCOS_THETA else 3; output_size = 2;
+    try:
+        input_size = 4 if config.USE_SINCOS_THETA else 3; output_size = 2;
+        if hasattr(input_scaler, 'n_features_in_') and input_scaler.n_features_in_ != input_size: input_size = input_scaler.n_features_in_; print(f"  使用来自 scaler 的 input_size = {input_size}")
+        if hasattr(target_scaler, 'n_features_in_') and target_scaler.n_features_in_ != output_size: output_size = target_scaler.n_features_in_; print(f"  使用来自 scaler 的 output_size = {output_size}")
     except AttributeError: print("Error: Scalers invalid."); return
     try: model = get_model(model_type=config.MODEL_TYPE, input_size=input_size, output_size=output_size); print("Model created successfully."); print(model)
     except Exception as e: print(f"Error creating model: {e}"); return
+
 
     # --- Step 5: Model Training ---
     # ... (Model training call remains the same) ...
@@ -128,7 +142,7 @@ def run_experiment():
     print("\n步骤6: 开始在验证集上评估模型...")
     eval_start_time = time.time(); model.to(device)
     if os.path.exists(config.MODEL_BEST_PATH) and best_epoch > 0:
-        try: model.load_state_dict(torch.load(config.MODEL_BEST_PATH, map_location=device)); print(f"已加载最佳模型 (来自 Epoch {best_epoch})")
+        try: model.load_state_dict(torch.load(config.MODEL_BEST_PATH, map_location=device, weights_only=True)); print(f"已加载最佳模型 (来自 Epoch {best_epoch})") # Added weights_only
         except Exception as e: print(f"Warning: Failed to load best model state. Error: {e}")
     else: print("使用训练结束时的模型状态进行评估。")
     criterion = nn.MSELoss(); avg_val_loss_final = evaluate_model(model, val_loader, criterion, device) if val_loader else float('nan')
@@ -142,7 +156,7 @@ def run_experiment():
         if not df_eval_segment.empty and len(df_eval_segment) > config.INPUT_SEQ_LEN + config.OUTPUT_SEQ_LEN:
             eval_data_values = df_eval_segment[['theta', 'theta_dot', 'tau']].values
             use_sincos_eval = config.USE_SINCOS_THETA
-            X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN, predict_delta=False, use_sincos=use_sincos_eval)
+            X_eval, _ = create_sequences(eval_data_values, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN, use_sincos=use_sincos_eval) # Removed predict_delta
             if len(X_eval) > 0:
                 if input_scaler.n_features_in_ != X_eval.shape[2]: raise ValueError(f"Input scaler/data feature mismatch: {input_scaler.n_features_in_} vs {X_eval.shape[2]}")
                 X_eval_scaled = input_scaler.transform(X_eval.reshape(-1, X_eval.shape[2])).reshape(X_eval.shape)
@@ -152,6 +166,7 @@ def run_experiment():
                      predicted_states, true_states = multi_step_prediction(model, initial_sequence_eval, df_for_pred_eval, config.INPUT_SEQ_LEN, config.OUTPUT_SEQ_LEN, prediction_steps_eval, input_scaler, target_scaler, device)
                      if len(predicted_states) > 0:
                            model_mse = np.mean((predicted_states - true_states)**2)
+                           # ... (Physics comparison generation remains the same) ...
                            physics_x0 = df_eval_segment.iloc[config.INPUT_SEQ_LEN][['theta', 'theta_dot']].values; physics_time_eval = df_for_pred_eval['time'].iloc[:prediction_steps_eval].values
                            if len(physics_time_eval) > 0:
                                 physics_t_span = (physics_time_eval[0], physics_time_eval[-1]); physics_tau_values = df_for_pred_eval['tau'].iloc[:prediction_steps_eval].values
@@ -166,10 +181,12 @@ def run_experiment():
     except Exception as eval_msp_e: print(f"执行多步预测评估时出错: {eval_msp_e}"); import traceback; traceback.print_exc()
     eval_time = time.time() - eval_start_time; print(f"模型评估完成，耗时: {eval_time:.2f}秒")
 
+
     # --- Final Summary ---
     # ... (Summary printing remains the same) ...
     total_time = time.time() - start_time; print(f"\n项目执行完毕！总耗时: {total_time:.2f}秒") # ... etc ...
     # ... (Print performance and model summaries) ...
+
 
 if __name__ == "__main__":
     run_experiment()

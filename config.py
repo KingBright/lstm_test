@@ -2,8 +2,7 @@
 
 """
 Configuration settings for the Pendulum experiment.
-Strategy: Random ICs, Random Torque, Short Simulations, Shuffle+Split, Seq2Seq.
-Physics validation removed.
+Strategy: Random ICs (gentler range), Random Torque (gentler), Short Simulations, Shuffle+Split, Seq2Seq.
 """
 
 import numpy as np
@@ -38,24 +37,36 @@ def get_current_model_params():
     return params
 
 # --- Training Hyperparameters ---
+# ... (remain the same) ...
 NUM_EPOCHS = 150; LEARNING_RATE = 0.0005; WEIGHT_DECAY = 1e-5; BATCH_SIZE = 128
 EARLY_STOPPING_PATIENCE = 20; SCHEDULER_FACTOR = 0.5; SCHEDULER_PATIENCE = 8
 
 # --- Simulation Parameters ---
 PENDULUM_MASS = 1.0; PENDULUM_LENGTH = 1.0; GRAVITY = 9.81; DAMPING_COEFF = 0.5
 DT = 0.02
-THETA_RANGE = [-np.pi / 2, np.pi / 2]; THETA_DOT_RANGE = [-3.0, 3.0]
-TORQUE_TYPE = "highly_random"; TORQUE_RANGE = [-1.0, 1.0]; TORQUE_CHANGE_STEPS = 10
-NUM_SIMULATIONS = 7000; SIMULATION_DURATION = 1.0; T_SPAN_SHORT = (0, SIMULATION_DURATION)
+
+# Random Initial Conditions Ranges - Adjusted
+THETA_RANGE = [-np.pi / 3, np.pi / 3] # Keep angle range
+THETA_DOT_RANGE = [-1.5, 1.5]         # <<<--- 减小角速度范围 (例如 -2 到 2)
+
+# Torque Scenario - Use only highly random, but adjust parameters
+TORQUE_TYPE = "highly_random"
+TORQUE_RANGE = [-0.5, 0.5] # <<<--- 减小力矩范围 (例如 -0.7 到 0.7)
+TORQUE_CHANGE_STEPS = 20   # <<<--- 增加力矩变化间隔 (例如 20 步 = 0.4 秒)
+
+# Simulation Generation Method
+NUM_SIMULATIONS = 7000 # Keep number of simulations for now
+SIMULATION_DURATION = 1.0 # Keep duration of each short simulation
+T_SPAN_SHORT = (0, SIMULATION_DURATION)
 
 # --- Data Handling ---
-COMBINED_DATA_FILE = f'combined_data_{MODEL_TYPE.lower().replace("seq2seq","")}{"_sincos" if USE_SINCOS_THETA else ""}.csv'
+COMBINED_DATA_FILE = f'combined_data_{MODEL_TYPE.lower().replace("seq2seq","")}{"_sincos" if USE_SINCOS_THETA else ""}_gentle.csv' # Add indicator
 FORCE_REGENERATE_DATA = False
 MODELS_DIR = 'models'; FIGURES_DIR = 'figures'
 PLOT_SCENARIO_DATA = False
 
 # --- Preprocessing Parameters ---
-INPUT_SEQ_LEN = 10; OUTPUT_SEQ_LEN = 3
+INPUT_SEQ_LEN = 10; OUTPUT_SEQ_LEN = 5
 VAL_SET_FRACTION = 0.2
 MIN_PREDICTION_STEPS = 50
 INPUT_SCALER_TYPE = "StandardScaler"
@@ -64,8 +75,10 @@ TARGET_SCALER_TYPE = "MinMaxScaler" # For Seq2Seq absolute state
 # --- Paths ---
 MODEL_BASENAME = f'pendulum_{MODEL_TYPE.lower()}'
 if USE_SINCOS_THETA: MODEL_BASENAME += "_sincos"
+MODEL_BASENAME += "_gentle" # Add indicator to model name
 MODEL_BEST_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_best.pth')
 MODEL_FINAL_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_final.pth')
+
 if MODEL_TYPE.lower().startswith("delta"): TARGET_SCALER_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_delta_scaler.pkl')
 else: TARGET_SCALER_PATH = os.path.join(MODELS_DIR, f'{MODEL_BASENAME}_output_scaler.pkl')
 INPUT_SCALER_FILENAME = f'{MODEL_BASENAME}_input_scaler.pkl'
@@ -73,7 +86,7 @@ INPUT_SCALER_PATH = os.path.join(MODELS_DIR, INPUT_SCALER_FILENAME)
 
 # --- Evaluation Parameters ---
 GOOD_MSE_THRESHOLD = 0.01
-PHYSICS_VALIDATION_TOLERANCE = 0.02 # <<<--- 移除或注释掉这一行
+PHYSICS_VALIDATION_TOLERANCE = 1e-3
 
 # --- Misc ---
 SEED = 42
