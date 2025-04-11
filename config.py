@@ -12,15 +12,15 @@ import os
 USE_SINCOS_THETA = True
 
 # --- Model Selection ---
-MODEL_TYPE = "Seq2SeqGRU" # Or Seq2SeqLSTM
+MODEL_TYPE = "Seq2SeqLSTM" # Or Seq2SeqLSTM
 
 # --- Model Architecture Parameters ---
 MODEL_PARAMS = {
     "defaults": { "dense_units": 64, "dropout_rate": 0.20 },
     "purelstm": { "hidden_size": 32, "num_layers": 2 },
     "puregru":  { "hidden_size": 32, "num_layers": 2 },
-    "seq2seqlstm":{ "hidden_size": 64, "num_layers": 2 },
-    "seq2seqgru": { "hidden_size": 64, "num_layers": 2 }
+    "seq2seqlstm":{ "hidden_size": 48, "num_layers": 2 },
+    "seq2seqgru": { "hidden_size": 48, "num_layers": 2 }
 }
 def get_current_model_params():
     # ... (function remains the same) ...
@@ -43,17 +43,17 @@ PENDULUM_MASS = 1.0; PENDULUM_LENGTH = 1.0; GRAVITY = 9.81; DAMPING_COEFF = 0.5
 DT = 0.02
 # 基础特定初始条件
 INITIAL_CONDITIONS_SPECIFIC = [
-    [0.0, 0.0], [0.3, -0.5], [-0.3, 0.5], [-1.0, -1.0], [1.0, 1.0]
+    [0.0, 0.0], [0.3, 0.5], [0.3, -0.5], [-0.3, 0.5], [-0.3, -0.5], [-1.0, -0.25], [-1.0, 0.25], [1.0, 0.25], [1.0, -0.25]
 ]
 
 # 优化的数据生成策略参数
 # 目标序列总数约100,000
-TARGET_SEQUENCES = 1000000
+TARGET_SEQUENCES = 200000
 # 角度和角速度范围参数 (用于随机初始条件)
-THETA_RANGE = [-np.pi/2, np.pi/2]  # 角度范围 [-90°, 90°]
-THETA_DOT_RANGE = [-1.0, 1.0]      # 角速度范围 [-2, 2] rad/s
+THETA_RANGE = [-np.pi/3, np.pi/3]  # 角度范围 [-90°, 90°]
+THETA_DOT_RANGE = [-0.5, 0.5]      # 角速度范围 [-2, 2] rad/s
 # 随机初始条件数量 (将会根据目标序列数自动计算)
-NUM_RANDOM_ICS = 500  # 默认值，会根据总序列需求自动调整
+NUM_RANDOM_ICS = 1000  # 默认值，会根据总序列需求自动调整
 
 # Torque 参数设置
 TORQUE_TYPE = "highly_random"
