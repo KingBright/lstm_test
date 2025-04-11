@@ -16,11 +16,11 @@ MODEL_TYPE = "Seq2SeqGRU" # Or Seq2SeqLSTM
 
 # --- Model Architecture Parameters ---
 MODEL_PARAMS = {
-    "defaults": { "dense_units": 32, "dropout_rate": 0.30 },
+    "defaults": { "dense_units": 64, "dropout_rate": 0.20 },
     "purelstm": { "hidden_size": 32, "num_layers": 2 },
     "puregru":  { "hidden_size": 32, "num_layers": 2 },
-    "seq2seqlstm":{ "hidden_size": 32, "num_layers": 2 },
-    "seq2seqgru": { "hidden_size": 16, "num_layers": 3 }
+    "seq2seqlstm":{ "hidden_size": 64, "num_layers": 2 },
+    "seq2seqgru": { "hidden_size": 64, "num_layers": 2 }
 }
 def get_current_model_params():
     # ... (function remains the same) ...

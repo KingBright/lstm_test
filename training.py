@@ -20,7 +20,7 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
                 final_model_info_path=config.MODEL_FINAL_PATH):
     """
     训练指定的神经网络模型（适用于单步或 Seq2Seq 输出）。
-    修正了 ReduceLROnPlateau 的 verbose 警告。
+    使用余弦退火学习率调度器并添加学习率预热。
     """
     start_time = time.time()
 
@@ -44,15 +44,29 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
     # 优化器
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    # 学习率调度器 - 使用正确的verbose参数
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=scheduler_factor,
-        patience=scheduler_patience,
-        verbose=False,  # 设为False以避免警告
-        min_lr=1e-7
-    )
+    # 学习率调度器 - 使用余弦退火+预热
+    # 计算总步数和预热步数
+    total_steps = len(train_loader) * num_epochs
+    warmup_steps = len(train_loader) * 5  # 预热5个周期
+    
+    # 创建余弦退火调度器函数
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # 线性预热
+            return float(current_step) / float(max(1, warmup_steps))
+        
+        # 预热后使用余弦衰减
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
+        
+        # 确保不低于最小学习率
+        min_lr_factor = 1e-6 / learning_rate  # 最小学习率为初始学习率的百万分之一
+        return max(min_lr_factor, cosine_decay)
+    
+    # 创建调度器
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    print(f"学习率调度: 使用余弦退火+预热(预热{warmup_steps}步，总计{total_steps}步)")
 
     # 检查 DataLoader
     train_loader_len = 0; val_loader_len = 0
@@ -69,6 +83,7 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
     # 初始化学习率变量用于比较
     current_lr = learning_rate
     prev_lr = current_lr
+    global_step = 0  # 跟踪总步数
 
     print(f"开始训练，最多 {num_epochs} 个周期...")
     epochs_ran = 0
@@ -87,6 +102,9 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
         grad_accumulation_steps = 1  # 默认为1，可根据内存情况调整
         
         for inputs, targets in train_loader:
+            # 更新全局步数
+            global_step += 1
+            
             # 使用 non_blocking=True 加速数据传输
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
@@ -120,12 +138,19 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
                     # 梯度裁剪以提高稳定性
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
+                    
+                    # 每批次更新学习率
+                    scheduler.step()
             except Exception as e:
                 print(f"训练反向/优化器错误: {e}")
                 return train_losses, val_losses, 0
                 
             running_train_loss += loss.item() * (1 if grad_accumulation_steps == 1 else grad_accumulation_steps)
             train_batches += 1
+            
+            # 每100步打印一次学习率
+            if global_step % 100 == 0:
+                print(f"  步骤 {global_step}/{total_steps}, 当前学习率: {optimizer.param_groups[0]['lr']:.6e}")
             
         # 如果是MPS设备，添加同步点确保所有操作完成
         if device.type == 'mps':
@@ -146,17 +171,15 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
              if val_batches > 0 and np.isfinite(running_val_loss): epoch_val_loss = running_val_loss / val_batches
              else: epoch_val_loss = float('nan')
              val_losses.append(epoch_val_loss)
-             # 仅当验证损失有效时才更新调度器
-             if np.isfinite(epoch_val_loss): scheduler.step(epoch_val_loss)
-             else: print("跳过 LR 调度器步骤。")
+             # 不再使用ReduceLROnPlateau调度器，所以这里不需要scheduler.step()
         else: val_losses.append(float('nan'))
 
         # --- 日志记录 ---
         epoch_time = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr'] # 获取当前学习率
         # +++ 手动检查并打印学习率变化 +++
-        if current_lr < prev_lr:
-             print(f"  学习率在周期 {epoch+1} 结束时降低: {prev_lr:.6e} -> {current_lr:.6e}")
+        if abs(current_lr - prev_lr) > 1e-8:  # 如果学习率变化超过阈值
+             print(f"  学习率在周期 {epoch+1} 结束时变化: {prev_lr:.6e} -> {current_lr:.6e}")
         # +++ 检查结束 +++
         if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == num_epochs - 1:
             val_loss_str = f"{epoch_val_loss:.6f}" if np.isfinite(epoch_val_loss) else "N/A"

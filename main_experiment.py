@@ -452,12 +452,52 @@ def run_experiment():
                             
                             if len(physics_time) == len(physics_time_eval):
                                 physics_predictions = np.stack([physics_theta, physics_theta_dot], axis=1)
-                                physics_mse = np.mean((physics_predictions - true_states)**2)
-                                print(f"物理模型MSE: {physics_mse:.6f}")
+                                
+                                # 确保物理预测和神经网络预测长度匹配
+                                actual_pred_steps = len(predicted_states)
+                                actual_true_steps = len(true_states)
+                                actual_physics_steps = len(physics_predictions)
+                                
+                                # 找到三者共同的最小长度
+                                min_length = min(actual_pred_steps, actual_true_steps, actual_physics_steps)
+                                
+                                if min_length > 0:
+                                    # 截取为相同长度
+                                    predicted_states_trimmed = predicted_states[:min_length]
+                                    true_states_trimmed = true_states[:min_length]
+                                    physics_predictions_trimmed = physics_predictions[:min_length]
+                                    
+                                    # 计算模型MSE (使用截取后的数据)
+                                    model_mse = np.mean((predicted_states_trimmed - true_states_trimmed)**2)
+                                    physics_mse = np.mean((physics_predictions_trimmed - true_states_trimmed)**2)
+                                    
+                                    print(f"最终使用 {min_length} 步数据计算指标")
+                                    print(f"神经网络模型MSE: {model_mse:.6f}")
+                                    print(f"物理模型MSE: {physics_mse:.6f}")
+                                    
+                                    # 更新变量以便绘图时使用
+                                    true_states = true_states_trimmed
+                                    predicted_states = predicted_states_trimmed
+                                    physics_predictions = physics_predictions_trimmed
+                                    physics_time_eval = physics_time_eval[:min_length]
+                                else:
+                                    print("警告: 没有足够的预测步数进行比较")
+                                    physics_predictions = None
                         
                         # 绘制多步预测结果
                         print("生成详细预测图表...")
                         plot_filename = f"multistep_eval_{config.MODEL_TYPE}"
+                        
+                        # 确保所有数据长度一致
+                        if physics_predictions is not None:
+                            if len(physics_time_eval) != len(true_states) or len(physics_time_eval) != len(predicted_states) or len(physics_time_eval) != len(physics_predictions):
+                                min_len = min(len(physics_time_eval), len(true_states), len(predicted_states), len(physics_predictions))
+                                physics_time_eval = physics_time_eval[:min_len]
+                                true_states = true_states[:min_len]
+                                predicted_states = predicted_states[:min_len]
+                                physics_predictions = physics_predictions[:min_len]
+                                print(f"所有数据已调整为共同的长度: {min_len}")
+                        
                         plot_multi_step_prediction(
                             physics_time_eval, 
                             true_states, 
