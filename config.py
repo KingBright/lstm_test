@@ -48,16 +48,16 @@ INITIAL_CONDITIONS_SPECIFIC = [
 
 # 优化的数据生成策略参数
 # 目标序列总数约100,000
-TARGET_SEQUENCES = 100000
+TARGET_SEQUENCES = 1000000
 # 角度和角速度范围参数 (用于随机初始条件)
 THETA_RANGE = [-np.pi/2, np.pi/2]  # 角度范围 [-90°, 90°]
-THETA_DOT_RANGE = [-2.0, 2.0]      # 角速度范围 [-2, 2] rad/s
+THETA_DOT_RANGE = [-1.0, 1.0]      # 角速度范围 [-2, 2] rad/s
 # 随机初始条件数量 (将会根据目标序列数自动计算)
 NUM_RANDOM_ICS = 500  # 默认值，会根据总序列需求自动调整
 
 # Torque 参数设置
 TORQUE_TYPE = "highly_random"
-TORQUE_RANGE = [-0.7, 0.7]  # 力矩范围
+TORQUE_RANGE = [-0.5, 0.5]  # 力矩范围
 # 力矩变化步长范围 (随机选择)
 TORQUE_CHANGE_STEPS_RANGE = [10, 30]  # 在每次模拟时随机选择力矩变化步长
 
@@ -68,7 +68,7 @@ T_SPAN = (0, SIMULATION_DURATION)  # 定义模拟时间段
 # --- Data Handling ---
 # Combined data file from optimized training data
 COMBINED_DATA_FILE = f'combined_optimized_{MODEL_TYPE.lower().replace("seq2seq","")}{"_sincos" if USE_SINCOS_THETA else ""}.csv'
-FORCE_REGENERATE_DATA = False
+FORCE_REGENERATE_DATA = True
 MODELS_DIR = 'models'; FIGURES_DIR = 'figures'
 PLOT_SCENARIO_DATA = False # Plotting individual scenarios less relevant now
 
