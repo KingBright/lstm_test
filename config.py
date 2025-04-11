@@ -20,7 +20,7 @@ MODEL_PARAMS = {
     "purelstm": { "hidden_size": 32, "num_layers": 2 },
     "puregru":  { "hidden_size": 32, "num_layers": 2 },
     "seq2seqlstm":{ "hidden_size": 32, "num_layers": 2 },
-    "seq2seqgru": { "hidden_size": 32, "num_layers": 2 }
+    "seq2seqgru": { "hidden_size": 16, "num_layers": 3 }
 }
 def get_current_model_params():
     # ... (function remains the same) ...

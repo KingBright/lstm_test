@@ -13,11 +13,22 @@ import time
 import config # Import config
 
 # create_sequences remains the same (handles Seq2Seq output shape and SinCos features)
-def create_sequences(data, input_seq_len=config.INPUT_SEQ_LEN, output_seq_len=config.OUTPUT_SEQ_LEN, use_sincos=config.USE_SINCOS_THETA):
+def create_sequences(data, simulation_boundaries=None, input_seq_len=config.INPUT_SEQ_LEN, output_seq_len=config.OUTPUT_SEQ_LEN, use_sincos=config.USE_SINCOS_THETA):
     """
     Creates input sequences and corresponding multi-step target sequences (Seq2Seq).
     Input features can be [theta, theta_dot, tau] or [sin(theta), cos(theta), theta_dot, tau].
     Target 'y' will be absolute states for the next 'output_seq_len' steps.
+    
+    Args:
+        data: 包含所有数据的数组
+        simulation_boundaries: 指示不同模拟边界的索引列表，None表示单一模拟
+        input_seq_len: 输入序列长度
+        output_seq_len: 输出序列长度
+        use_sincos: 是否使用sin/cos特征
+        
+    Returns:
+        X: 输入序列数组
+        y: 目标序列数组
     """
     X, y = [], []
     if data.shape[1] < 3: print(f"Error: Data needs at least 3 features."); return np.empty((0, input_seq_len, data.shape[1])), np.empty((0, output_seq_len, 2))
@@ -25,30 +36,52 @@ def create_sequences(data, input_seq_len=config.INPUT_SEQ_LEN, output_seq_len=co
     total_len_needed = input_seq_len + output_seq_len
     if len(data) < total_len_needed: print(f"Warning: Data length ({len(data)}) < {total_len_needed}."); return np.empty((0, input_seq_len, num_input_features)), np.empty((0, output_seq_len, num_output_features))
 
-    for i in range(len(data) - total_len_needed + 1):
-        input_window = data[i : i + input_seq_len]
-        target_window = data[i + input_seq_len : i + input_seq_len + output_seq_len]
-        theta_in = input_window[:, 0]; theta_dot_in = input_window[:, 1]; tau_in = input_window[:, 2]
-        if use_sincos: input_seq = np.stack([np.sin(theta_in), np.cos(theta_in), theta_dot_in, tau_in], axis=1)
-        else: input_seq = np.stack([theta_in, theta_dot_in, tau_in], axis=1)
-        target_seq = target_window[:, 0:num_output_features] # Absolute states
-        X.append(input_seq); y.append(target_seq)
+    # 如果没有提供模拟边界，则假设所有数据是单一模拟
+    if simulation_boundaries is None:
+        simulation_boundaries = [0, len(data)]
+    else:
+        # 确保边界列表以0开始，以数据长度结束
+        if simulation_boundaries[0] != 0:
+            simulation_boundaries = [0] + simulation_boundaries
+        if simulation_boundaries[-1] != len(data):
+            simulation_boundaries.append(len(data))
+    
+    # 针对每个模拟段落创建序列
+    for sim_idx in range(len(simulation_boundaries) - 1):
+        start_idx = simulation_boundaries[sim_idx]
+        end_idx = simulation_boundaries[sim_idx + 1]
+        
+        # 确保这个模拟段有足够的数据点生成序列
+        if end_idx - start_idx < total_len_needed:
+            continue
+            
+        # 在当前模拟段内创建序列
+        for i in range(start_idx, end_idx - total_len_needed + 1):
+            input_window = data[i : i + input_seq_len]
+            target_window = data[i + input_seq_len : i + input_seq_len + output_seq_len]
+            theta_in = input_window[:, 0]; theta_dot_in = input_window[:, 1]; tau_in = input_window[:, 2]
+            if use_sincos: input_seq = np.stack([np.sin(theta_in), np.cos(theta_in), theta_dot_in, tau_in], axis=1)
+            else: input_seq = np.stack([theta_in, theta_dot_in, tau_in], axis=1)
+            target_seq = target_window[:, 0:num_output_features] # Absolute states
+            X.append(input_seq); y.append(target_seq)
 
     if not X: return np.empty((0, input_seq_len, num_input_features)), np.empty((0, output_seq_len, num_output_features))
     return np.array(X), np.array(y)
 
 
-# --- NEW Core Function for Time-Split Data Prep (Seq2Seq) ---
-def prepare_timesplit_seq2seq_data(df_all, input_sequence_length=config.INPUT_SEQ_LEN,
+# --- NEW Core Function for Time-Split Data Prep (Seq2Seq) with Simulation Boundaries ---
+def prepare_timesplit_seq2seq_data(df_all, simulation_boundaries=None, input_sequence_length=config.INPUT_SEQ_LEN,
                                    output_sequence_length=config.OUTPUT_SEQ_LEN,
                                    val_split_ratio=config.VALIDATION_SPLIT,
                                    seed=config.SEED):
     """
     Prepares training and validation DataLoaders from a single combined DataFrame
     using a chronological split for train/validation sets. Handles Seq2Seq targets.
+    Respects simulation boundaries to prevent mixing data from different initial conditions.
 
     Args:
         df_all (pd.DataFrame): DataFrame containing all combined simulation data.
+        simulation_boundaries (list): 指示不同模拟边界的行索引列表.
         input_sequence_length (int): Length of input sequences (N).
         output_sequence_length (int): Length of output sequences (K).
         val_split_ratio (float): Proportion of total sequences for the validation set.
@@ -69,9 +102,17 @@ def prepare_timesplit_seq2seq_data(df_all, input_sequence_length=config.INPUT_SE
     print(f"Using sin/cos features: {use_sincos}, Predicting absolute state sequence.")
 
     # --- Create ALL Sequences ---
-    print("Creating all sequences from combined data...")
+    print("Creating all sequences from combined data, respecting simulation boundaries...")
     data_values = df_all[required_cols].values
-    X_all, y_all = create_sequences(data_values, input_sequence_length, output_sequence_length, use_sincos=use_sincos)
+    
+    # 创建序列，考虑模拟边界
+    X_all, y_all = create_sequences(
+        data_values, 
+        simulation_boundaries=simulation_boundaries,
+        input_seq_len=input_sequence_length, 
+        output_seq_len=output_sequence_length, 
+        use_sincos=use_sincos
+    )
 
     if X_all.shape[0] == 0 or y_all.shape[0] == 0:
         print("Error: No sequences created."); return (None,) * 4
@@ -187,8 +228,9 @@ def prepare_timesplit_seq2seq_data(df_all, input_sequence_length=config.INPUT_SE
     return train_loader, val_loader, input_scaler, target_scaler
 
 
-# --- Modified get_test_data_and_scalers for Chronological Split ---
+# --- Modified get_test_data_and_scalers for Chronological Split with Simulation Boundaries ---
 def get_test_data_and_scalers(data_path=config.COMBINED_DATA_FILE, # Load the combined file
+                              simulation_boundaries=None, # 新增模拟边界参数
                               sequence_length=config.INPUT_SEQ_LEN,
                               output_sequence_length=config.OUTPUT_SEQ_LEN, # Needed for create_sequences
                               val_split_ratio=config.VALIDATION_SPLIT, # Use this to find the val part
@@ -201,6 +243,7 @@ def get_test_data_and_scalers(data_path=config.COMBINED_DATA_FILE, # Load the co
 
     Args:
         data_path (str): Path to the combined dataset CSV file.
+        simulation_boundaries (list): 指示不同模拟边界的行索引列表.
         sequence_length (int): Length of input sequences (N).
         output_sequence_length (int): Length of output sequences (K).
         val_split_ratio (float): Proportion used for validation set during training.
@@ -241,7 +284,13 @@ def get_test_data_and_scalers(data_path=config.COMBINED_DATA_FILE, # Load the co
     # Use predict_delta=False because we need X sequences of absolute states
     data_values = df_all[required_cols[:3]].values
     print("Creating all sequences to determine validation split...")
-    X_all, _ = create_sequences(data_values, sequence_length, output_sequence_length, use_sincos=use_sincos)
+    X_all, _ = create_sequences(
+        data_values, 
+        simulation_boundaries=simulation_boundaries,  # 传入模拟边界
+        input_seq_len=sequence_length, 
+        output_seq_len=output_sequence_length, 
+        use_sincos=use_sincos
+    )
 
     if X_all.shape[0] == 0:
         print("Error: No sequences created from combined data file."); return None, None, input_scaler, target_scaler

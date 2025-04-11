@@ -228,9 +228,28 @@ def run_experiment():
     # --- Step 3: Prepare DataLoaders using Chronological Split ---
     print("\n步骤3: 创建序列并按时序分割训练/验证集...")
     data_prep_start_time = time.time()
-    # --- VVVVVV 调用新的时序分割数据准备函数 VVVVVV ---
+    
+    # 跟踪不同模拟的边界
+    simulation_boundaries = []
+    current_row_count = 0
+    
+    # 对于之前所有模拟数据的DataFrame
+    for df in all_dfs:
+        if not df.empty:
+            # 添加当前模拟结束的行索引
+            current_row_count += len(df)
+            simulation_boundaries.append(current_row_count)
+    
+    # 排除最后一个边界（它是数据的总长度）
+    if simulation_boundaries and simulation_boundaries[-1] == len(df_all):
+        simulation_boundaries = simulation_boundaries[:-1]
+    
+    print(f"找到 {len(simulation_boundaries)+1} 个独立模拟，使用这些边界确保序列不跨越不同模拟数据")
+    
+    # --- VVVVVV 调用新的时序分割数据准备函数，传入模拟边界 VVVVVV ---
     data_loaders_tuple = prepare_timesplit_seq2seq_data(
         df_all, # Pass the combined dataframe
+        simulation_boundaries=simulation_boundaries,  # 传入模拟边界
         input_sequence_length=config.INPUT_SEQ_LEN,
         output_sequence_length=config.OUTPUT_SEQ_LEN,
         val_split_ratio=config.VALIDATION_SPLIT, # Pass the split ratio
@@ -368,8 +387,9 @@ def run_experiment():
             # 创建模型输入序列
             X_eval, _ = create_sequences(
                 eval_data_values, 
-                config.INPUT_SEQ_LEN, 
-                config.OUTPUT_SEQ_LEN, 
+                simulation_boundaries=None,  # 单一模拟数据，不需要边界信息
+                input_seq_len=config.INPUT_SEQ_LEN, 
+                output_seq_len=config.OUTPUT_SEQ_LEN, 
                 use_sincos=use_sincos_eval
             )
             
