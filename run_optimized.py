@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import torch
+import numpy as np
 import subprocess
 import multiprocessing
 from pathlib import Path
@@ -105,6 +106,27 @@ def run_experiment_with_performance_tracking():
     process = psutil.Process(os.getpid())
     initial_memory = process.memory_info().rss / 1024 / 1024  # MB
     
+    # 测试修复后的Latin Hypercube采样函数
+    print("测试Latin Hypercube采样函数...")
+    try:
+        from improved_data_generation import generate_latin_hypercube_samples
+        test_samples_count = 5
+        test_param_ranges = {
+            'theta': [-np.pi, np.pi],
+            'theta_dot': [-3.0, 3.0]
+        }
+        print(f"测试参数: samples_count={test_samples_count}, param_ranges={test_param_ranges}")
+        test_params = generate_latin_hypercube_samples(test_samples_count, test_param_ranges)
+        print(f"测试成功! 生成了 {len(test_params['theta'])} 个样本")
+        print(f"样本theta值: {test_params['theta']}")
+        print(f"样本theta_dot值: {test_params['theta_dot']}")
+        print("Latin Hypercube采样测试成功!")
+    except Exception as e:
+        print(f"测试Latin Hypercube采样函数失败: {e}")
+        import traceback
+        traceback.print_exc()
+        # 继续尝试运行实验
+    
     try:
         # 导入并运行主实验
         print("导入主实验模块...")
@@ -138,8 +160,16 @@ def run_experiment_with_performance_tracking():
         
     except Exception as e:
         print(f"\n错误: 实验执行失败: {e}")
+        print(f"错误类型: {type(e).__name__}")
         import traceback
         traceback.print_exc()
+        
+        # 写入错误日志到文件
+        with open('error_log.txt', 'w') as error_file:
+            error_file.write(f"错误: {str(e)}\n")
+            error_file.write(f"错误类型: {type(e).__name__}\n")
+            traceback.print_exc(file=error_file)
+        
         return False
 
 def main():

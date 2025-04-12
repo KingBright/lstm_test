@@ -1,0 +1,52 @@
+错误: not enough values to unpack (expected 3, got 2)
+错误类型: ValueError
+joblib.externals.loky.process_executor._RemoteTraceback: 
+"""
+Traceback (most recent call last):
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/externals/loky/process_executor.py", line 463, in _process_worker
+    r = call_item()
+        ^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/externals/loky/process_executor.py", line 291, in __call__
+    return self.fn(*self.args, **self.kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 598, in __call__
+    return [func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 598, in <listcomp>
+    return [func(*args, **kwargs)
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jinliang/Workspace/apps/LSTM_demo/improved_data_generation.py", line 759, in process_simulation
+    theta0, theta_dot0, tau_value = x0
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: not enough values to unpack (expected 3, got 2)
+"""
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/jinliang/Workspace/apps/LSTM_demo/run_optimized.py", line 136, in run_experiment_with_performance_tracking
+    main_experiment.run_experiment()
+  File "/Users/jinliang/Workspace/apps/LSTM_demo/main_experiment.py", line 123, in run_experiment
+    df_all, simulation_boundaries = generate_improved_dataset(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jinliang/Workspace/apps/LSTM_demo/improved_data_generation.py", line 886, in generate_improved_dataset
+    all_dfs, boundaries = generate_optimized_simulation_data(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jinliang/Workspace/apps/LSTM_demo/improved_data_generation.py", line 799, in generate_optimized_simulation_data
+    results = Parallel(n_jobs=-1)(
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 2007, in __call__
+    return output if self.return_generator else list(output)
+                                                ^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 1650, in _get_outputs
+    yield from self._retrieve()
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 1754, in _retrieve
+    self._raise_error_fast()
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 1789, in _raise_error_fast
+    error_job.get_result(self.timeout)
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 745, in get_result
+    return self._return_or_raise()
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/envs/pendulum/lib/python3.11/site-packages/joblib/parallel.py", line 763, in _return_or_raise
+    raise self._result
+ValueError: not enough values to unpack (expected 3, got 2)
