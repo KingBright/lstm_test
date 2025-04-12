@@ -750,14 +750,23 @@ def generate_optimized_simulation_data(pendulum, initial_conditions,
     
     def process_simulation(i, x0):
         """为单组初始条件生成仿真数据"""
-        # 显示进度
-        if len(x0) < 3:
-            print(f"  生成模拟 {i+1}/{num_simulations} (IC: 初始条件不足)...")
-        elif i % 10 == 0 or i == num_simulations - 1:
-            print(f"  生成模拟 {i+1}/{num_simulations} (IC: [{x0[0]:.3f}, {x0[1]:.3f}, {x0[2]:.3f}])...")
-        
-        if len(x0) != 3:
-            print(f"  生成模拟 {i+1}/{num_simulations} (IC: 初始条件数量错误)...")
+        try:
+            # Handle different IC formats
+            if len(x0) == 2:
+                theta0, theta_dot0 = x0
+                tau_value = np.random.uniform(config.TORQUE_RANGE[0], config.TORQUE_RANGE[1])
+                print(f"  生成模拟 {i+1}/{num_simulations} (IC: [{theta0:.3f}, {theta_dot0:.3f}, {tau_value:.3f}] - random tau)...")
+            elif len(x0) == 3:
+                theta0, theta_dot0, tau_value = x0
+                print(f"  生成模拟 {i+1}/{num_simulations} (IC: [{theta0:.3f}, {theta_dot0:.3f}, {tau_value:.3f}])...")
+            else:
+                print(f"  生成模拟 {i+1}/{num_simulations} (IC: 初始条件数量错误，预期2个或3个值)...")
+                return pd.DataFrame()
+        except (TypeError, ValueError) as e:
+            print(f"  Error in simulation {i+1}: Initial conditions are missing, {e}")
+            return pd.DataFrame()
+
+        if len(x0) == 0:
             return pd.DataFrame()
         theta0, theta_dot0, tau_value = x0
         
@@ -869,6 +878,16 @@ def generate_improved_dataset(target_sequences=config.TARGET_SEQUENCES, dt=confi
     }
     lhs_params = generate_latin_hypercube_samples(lhs_samples_count, lhs_param_ranges)
     lhs_ics = [[lhs_params['theta'][i], lhs_params['theta_dot'][i]] for i in range(lhs_samples_count)]
+    
+    # Add a random torque value to each of their entries
+    for ic in specific_ics:
+        if len(ic) == 2:
+            ic.append(np.random.uniform(config.TORQUE_RANGE[0], config.TORQUE_RANGE[1]))
+    
+    # Add a random torque value to each of their entries
+    for ic in lhs_ics:
+        if len(ic) == 2:
+            ic.append(np.random.uniform(config.TORQUE_RANGE[0], config.TORQUE_RANGE[1]))
     
     # 3.3 使用物理能量级别生成更多有意义的初始条件
     physics_samples_count = simulations_needed - len(specific_ics) - len(lhs_ics)
