@@ -6,213 +6,278 @@ from scipy.integrate import solve_ivp
 import config # Import config for parameters like SEED, DT, T_SPAN_LONG etc.
 
 # --- Global Torque Handling ---
-# (保持不变)
 _global_tau_values = None
 _global_t_span_start = 0
 _global_dt = config.DT
 def set_global_torque_params(tau_values, t_span_start, dt):
+    """Sets global torque parameters for use by the ODE solver."""
     global _global_tau_values, _global_t_span_start, _global_dt
     if tau_values is not None:
-        _global_tau_values = tau_values; _global_t_span_start = t_span_start
+        _global_tau_values = tau_values
+        _global_t_span_start = t_span_start
         _global_dt = dt if dt > 0 else config.DT
-    else: _global_tau_values = None
+    else:
+        _global_tau_values = None
+
 def get_tau_at_time_global(time):
-    if _global_tau_values is None or _global_dt <= 0 or len(_global_tau_values) == 0: return 0.0
+    """Gets the torque value at a specific time from the global sequence."""
+    if _global_tau_values is None or _global_dt <= 0 or len(_global_tau_values) == 0:
+        return 0.0
+    # Calculate index, ensuring it's within bounds
     idx = int((time - _global_t_span_start) / _global_dt)
-    idx = max(0, min(idx, len(_global_tau_values) - 1)); return _global_tau_values[idx]
+    idx = max(0, min(idx, len(_global_tau_values) - 1))
+    return _global_tau_values[idx]
 
 # --- Pendulum System Definition ---
-# (保持不变)
 class PendulumSystem:
+    """Represents the damped pendulum system with external torque."""
     def __init__(self, m=config.PENDULUM_MASS, L=config.PENDULUM_LENGTH, g=config.GRAVITY, c=config.DAMPING_COEFF):
-        self.m = m; self.L = L; self.g = g; self.c = c
-        if self.m <= 0 or self.L <= 0: raise ValueError("Mass (m) and Length (L) must be positive.")
-        self.beta = self.c / (self.m * self.L**2)
-        self.omega0_sq = self.g / self.L
+        self.m = m
+        self.L = L
+        self.g = g
+        self.c = c
+        if self.m <= 0 or self.L <= 0:
+            raise ValueError("Mass (m) and Length (L) must be positive.")
+        # Pre-calculate constants for the ODE
+        self.beta = self.c / (self.m * self.L**2) # Damping term coefficient
+        self.omega0_sq = self.g / self.L          # Natural frequency squared
         # print(f"PendulumSystem initialized: m={m}, L={L}, g={g}, c={c} -> beta={self.beta:.3f}, omega0_sq={self.omega0_sq:.3f}")
 
-    def ode(self, t, x, current_tau=None): # Accepts tau directly
+    def ode(self, t, x, current_tau=None):
+        """The ordinary differential equation for the pendulum system."""
         theta, theta_dot = x
-        tau = current_tau if current_tau is not None else get_tau_at_time_global(t) # Fallback for solve_ivp if needed
+        # Use provided torque if available, otherwise lookup from global sequence
+        tau = current_tau if current_tau is not None else get_tau_at_time_global(t)
         dtheta_dt = theta_dot
-        dtheta_dot_dt = (-self.beta * theta_dot - self.omega0_sq * np.sin(theta) + tau / (self.m * self.L**2))
+        # Pendulum equation: theta'' = -beta*theta' - omega0^2*sin(theta) + tau / (m*L^2)
+        dtheta_dot_dt = (-self.beta * theta_dot
+                         - self.omega0_sq * np.sin(theta)
+                         + tau / (self.m * self.L**2))
         return np.array([dtheta_dt, dtheta_dot_dt])
 
-# --- 优化的力矩序列生成 ---
-def generate_torque_sequence(t, type="highly_random", torque_change_steps=None): 
+# --- Enhanced Torque Sequence Generation ---
+def generate_torque_sequence(t, type="highly_random", torque_change_steps=None):
     """
-    生成不同类型的力矩输入序列。
-    
+    Generates different types of torque input sequences.
+
     Args:
-        t: 时间点数组
-        type: 力矩类型 ("zero", "step", "sine", "random", "mixed", "highly_random")
-        torque_change_steps: 力矩变化的步数，如果为None则使用配置中的值或随机值
+        t (np.array): Array of time points.
+        type (str): Torque type ("zero", "step", "sine", "ramp", "highly_random").
+        torque_change_steps (int, optional): Steps for torque change in 'highly_random'.
+                                             Defaults to None, using config range.
+
+    Returns:
+        np.array: Generated torque sequence, clipped to config.TORQUE_RANGE.
     """
     t = np.asarray(t)
-    if t.ndim == 0: t = np.array([t])
+    if t.ndim == 0: t = np.array([t]) # Ensure t is an array
     num_steps = len(t)
     if num_steps == 0: return np.array([])
-    max_time = t.max() if len(t) > 0 else 0
+    dt = t[1] - t[0] if num_steps > 1 else config.DT # Estimate dt
+    max_time = t[-1] if num_steps > 0 else 0
+    torque_min, torque_max = config.TORQUE_RANGE
 
-    # 为每次调用生成不同的随机种子，但保持可再现性
-    current_state = np.random.get_state()
-    local_seed = np.random.randint(0, 2**32)
-    np.random.seed(local_seed)
+    tau = np.zeros_like(t) # Initialize torque array
 
     if type == "zero":
-        return np.zeros_like(t)
+        pass # Already zeros
     elif type == "step":
-        tau = np.zeros_like(t); step_time = max_time * 0.3; tau[t >= step_time] = 1.0; return tau
+        # Generate 1 to 3 random steps
+        num_steps_change = np.random.randint(1, 4)
+        step_times = np.sort(np.random.uniform(t[0] + dt, max_time - dt, num_steps_change))
+        last_time = t[0]
+        last_val = 0.0 # Start at zero torque
+        for step_time in step_times:
+            # Assign value for the segment before the step
+            tau[(t >= last_time) & (t < step_time)] = last_val
+            # Choose a new random value for the next segment
+            last_val = np.random.uniform(torque_min, torque_max)
+            last_time = step_time
+        # Assign value for the last segment
+        tau[t >= last_time] = last_val
     elif type == "sine":
-        amplitude = 0.5; frequency = 0.5; return amplitude * np.sin(2 * np.pi * frequency * t)
-    elif type == "random": # Original piecewise random
-        segment_length = 20
-        if segment_length <= 0:
-            segment_length = 1
-        num_segments = (num_steps + segment_length - 1) // segment_length
-        segments = np.random.uniform(-0.8, 0.8, num_segments)
-        repeated_segments = np.repeat(segments, segment_length)
-        np.random.set_state(current_state)  # 恢复随机状态
-        return repeated_segments[:num_steps]
-    elif type == "mixed": # Original mixed sequence
-        tau = np.zeros_like(t); quarter = num_steps // 4; idx_q1, idx_q2, idx_q3 = quarter, 2 * quarter, 3 * quarter
-        if idx_q1 < idx_q2: tau[idx_q1:idx_q2] = 0.8 # Step
-        t_sine_segment = t[idx_q2:idx_q3];
-        if len(t_sine_segment) > 0: sine_part = 0.5 * np.sin(2 * np.pi * 1.0 * t_sine_segment); tau[idx_q2 : idx_q2 + len(sine_part)] = sine_part # Sine
-        segment_length = 10; random_start_idx = idx_q3; num_random_steps_needed = num_steps - random_start_idx
-        if num_random_steps_needed > 0 and segment_length > 0:
-             num_segments = (num_random_steps_needed + segment_length - 1) // segment_length; segments = np.random.uniform(-0.8, 0.8, num_segments)
-             repeated_segments = np.repeat(segments, segment_length); tau[random_start_idx:] = repeated_segments[:num_random_steps_needed] # Random
-        np.random.set_state(current_state)  # 恢复随机状态
-        return tau
-    elif type == "highly_random": # 优化的随机力矩生成
-        tau = np.zeros_like(t)
-        
-        # 确定力矩变化步长
+        # Random amplitude and frequency
+        # Ensure amplitude doesn't exceed half the range for centering
+        max_amp = (torque_max - torque_min) / 2.5 # Slightly less than half range
+        amplitude = np.random.uniform(max_amp * 0.1, max_amp)
+        # Frequency in Hz (cycles per second)
+        min_freq = 0.1 / (max_time if max_time > 0 else 1) # At least 0.1 cycle
+        max_freq = 5.0 / (max_time if max_time > 0 else 1) # Up to 5 cycles
+        frequency = np.random.uniform(min_freq, max_freq)
+        phase = np.random.uniform(0, 2 * np.pi)
+        # Center the sine wave within the torque range
+        center = np.random.uniform(torque_min + amplitude, torque_max - amplitude)
+        tau = center + amplitude * np.sin(2 * np.pi * frequency * t + phase)
+    elif type == "ramp":
+        # Linear ramp between two random points within the range
+        start_val = np.random.uniform(torque_min, torque_max)
+        end_val = np.random.uniform(torque_min, torque_max)
+        tau = np.linspace(start_val, end_val, num_steps)
+    elif type == "highly_random": # Original piecewise constant random
+        # Determine steps for change
         if torque_change_steps is None:
-            # 如果未指定，则在配置的范围内随机选择一个值
             if hasattr(config, 'TORQUE_CHANGE_STEPS_RANGE'):
                 change_steps = np.random.randint(
-                    config.TORQUE_CHANGE_STEPS_RANGE[0], 
+                    config.TORQUE_CHANGE_STEPS_RANGE[0],
                     config.TORQUE_CHANGE_STEPS_RANGE[1] + 1
                 )
             else:
-                # 向后兼容旧配置
-                change_steps = getattr(config, 'TORQUE_CHANGE_STEPS', 20)
+                change_steps = getattr(config, 'TORQUE_CHANGE_STEPS', 20) # Fallback
         else:
             change_steps = torque_change_steps
-            
-        if change_steps <= 0:
-            change_steps = 1
-            
-        # 计算分段数
+        change_steps = max(1, int(change_steps)) # Ensure positive integer
+
         num_segments = (num_steps + change_steps - 1) // change_steps
-        
-        # 确保力矩值在范围内均匀分布
-        # 使用分层采样策略确保更均匀的分布
-        segment_positions = np.linspace(0, 1, num_segments)
-        np.random.shuffle(segment_positions)  # 随机打乱顺序但保持分布均匀性
-        
-        # 将位置映射到力矩值范围
-        torque_min, torque_max = config.TORQUE_RANGE
-        torque_values_for_segments = torque_min + segment_positions * (torque_max - torque_min)
-        
-        # 重复值以创建分段力矩序列
-        tau = np.repeat(torque_values_for_segments, change_steps)[:num_steps]  # 确保正确长度
-        
-        np.random.set_state(current_state)  # 恢复随机状态
-        return tau
+        # Sample segment values uniformly within the range
+        segment_values = np.random.uniform(torque_min, torque_max, num_segments)
+        tau = np.repeat(segment_values, change_steps)[:num_steps] # Ensure correct length
     else:
-        np.random.set_state(current_state)  # 恢复随机状态
-        raise ValueError(f"Unknown torque type: {type}")
+        print(f"Warning: Unknown torque type '{type}'. Using zero torque.")
+        # Already zeros
+
+    # Clip the final torque sequence to the allowed range
+    tau = np.clip(tau, torque_min, torque_max)
+    return tau
 
 
 # --- Simulation Execution (using solve_ivp) ---
-# (保持不变, 使用修正后的版本)
 def run_simulation(pendulum, t_span, dt, x0, tau_values, t_eval=None):
-    if t_eval is None: t_eval = np.arange(t_span[0], t_span[1] + dt/2, dt) # Include endpoint approx
-    if not isinstance(t_eval, np.ndarray) or t_eval.ndim != 1 or len(t_eval) == 0: return np.array([]), np.array([]), np.array([])
-    effective_t_span = (t_eval[0], t_eval[-1])
-    set_global_torque_params(tau_values, t_span[0], dt)
-    try:
-        sol = solve_ivp(lambda t, x: pendulum.ode(t, x, current_tau=None), # Use global lookup for tau
-                        effective_t_span, x0, method='RK45', t_eval=t_eval, dense_output=False)
-        set_global_torque_params(None, 0, config.DT) # Reset globals
-        if sol.status != 0: print(f"Warning: ODE solver status {sol.status}: {sol.message}"); return np.array([]), np.array([]), np.array([])
-        if len(sol.t) != len(t_eval): print(f"Warning: Solver output length mismatch.")
-        return sol.t, sol.y[0], sol.y[1]
-    except Exception as e: print(f"Error during ODE solving: {e}"); set_global_torque_params(None, 0, config.DT); return np.array([]), np.array([]), np.array([])
+    """Runs the ODE simulation using solve_ivp."""
+    if t_eval is None:
+        t_eval = np.arange(t_span[0], t_span[1] + dt/2, dt) # Include endpoint approx
+    if not isinstance(t_eval, np.ndarray) or t_eval.ndim != 1 or len(t_eval) == 0:
+        print("Warning: Invalid t_eval in run_simulation.")
+        return np.array([]), np.array([]), np.array([])
 
-# --- 优化的仿真数据生成 ---
-def generate_simulation_data(pendulum, t_span=config.T_SPAN, dt=config.DT, x0=None, 
+    # Ensure tau_values match t_eval length if possible, pad if necessary
+    if len(tau_values) < len(t_eval):
+        print(f"Warning: tau_values length ({len(tau_values)}) < t_eval length ({len(t_eval)}). Padding with last value.")
+        padding = np.full(len(t_eval) - len(tau_values), tau_values[-1] if len(tau_values)>0 else 0)
+        tau_values = np.concatenate((tau_values, padding))
+    elif len(tau_values) > len(t_eval):
+         print(f"Warning: tau_values length ({len(tau_values)}) > t_eval length ({len(t_eval)}). Truncating.")
+         tau_values = tau_values[:len(t_eval)]
+
+
+    effective_t_span = (t_eval[0], t_eval[-1])
+    set_global_torque_params(tau_values, t_span[0], dt) # Set for potential ODE lookup
+
+    try:
+        sol = solve_ivp(
+            fun=lambda t, x: pendulum.ode(t, x, current_tau=None), # ODE func
+            t_span=effective_t_span,    # Time interval
+            y0=x0,                      # Initial state
+            method='RK45',              # Integrator method
+            t_eval=t_eval,              # Times to store solution at
+            dense_output=False          # Don't need dense output
+            # rtol=1e-5, atol=1e-8      # Optional: Adjust tolerances
+        )
+        set_global_torque_params(None, 0, config.DT) # Reset globals after solve
+
+        if sol.status != 0:
+            print(f"Warning: ODE solver finished with status {sol.status}: {sol.message}")
+            # Return empty arrays on solver failure, but maybe allow status 1 (root found)?
+            # if sol.status < 0: # Only return empty for definite errors
+            return np.array([]), np.array([]), np.array([])
+
+        # Check if output length matches t_eval
+        if len(sol.t) != len(t_eval):
+            print(f"Warning: Solver output length ({len(sol.t)}) mismatch with t_eval length ({len(t_eval)}).")
+            # Attempt to interpolate if lengths differ significantly? Or return empty?
+            # For now, return what we got, but be aware.
+            # Let's return empty if mismatch is drastic
+            if abs(len(sol.t) - len(t_eval)) > 1:
+                 print("  Mismatch too large, returning empty.")
+                 return np.array([]), np.array([]), np.array([])
+
+        # Return time, theta, theta_dot
+        return sol.t, sol.y[0], sol.y[1]
+
+    except Exception as e:
+        print(f"Error during ODE solving: {e}")
+        set_global_torque_params(None, 0, config.DT) # Ensure reset on error
+        return np.array([]), np.array([]), np.array([])
+
+
+# --- Original Simulation Data Generation (for single trajectories) ---
+def generate_simulation_data(pendulum, t_span=config.T_SPAN, dt=config.DT, x0=None,
                             torque_type="highly_random", torque_change_steps=None):
     """
-    为给定配置生成仿真数据。
-    
+    Generates simulation data for a single trajectory with specified torque type.
+    Used for generating evaluation segments.
+
     Args:
-        pendulum: 单摆系统实例
-        t_span: 仿真时间跨度 (start, end)
-        dt: 时间步长
-        x0: 初始状态 [theta, theta_dot]，如果为None则随机生成
-        torque_type: 力矩类型
-        torque_change_steps: 力矩变化步长，None表示使用配置值或随机值
-    
+        pendulum: PendulumSystem instance.
+        t_span: Simulation time span (start, end).
+        dt: Time step.
+        x0: Initial state [theta, theta_dot]. If None, random values are used.
+        torque_type: Type of torque sequence to generate.
+        torque_change_steps: Steps for torque change (used by 'highly_random').
+
     Returns:
-        DataFrame包含仿真数据 (time, theta, theta_dot, tau)
+        pd.DataFrame: DataFrame containing simulation data (time, theta, theta_dot, tau).
     """
-    # 随机初始条件处理
-    if x0 is None: 
+    # Handle initial conditions
+    if x0 is None:
         x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]
-    elif len(x0) != 2: 
-        print("Warning: Invalid x0 provided, using random.")
+    elif len(x0) != 2:
+        print("Warning: Invalid x0 provided to generate_simulation_data, using random.")
         x0 = [np.random.uniform(*config.THETA_RANGE), np.random.uniform(*config.THETA_DOT_RANGE)]
 
-    # 确保t_full正确覆盖时间跨度
+    # Generate time vector
     t_full = np.arange(t_span[0], t_span[1] + dt/2, dt)
-    if len(t_full) == 0: 
+    if len(t_full) == 0:
         return pd.DataFrame({'time': [], 'theta': [], 'theta_dot': [], 'tau': []})
 
-    # 生成力矩序列，使用提供的torque_change_steps或随机值
+    # Generate the torque sequence for this simulation
     tau_values = generate_torque_sequence(t_full, type=torque_type, torque_change_steps=torque_change_steps)
 
-    # 运行仿真
+    # Run the simulation
     time_points, theta_values, theta_dot_values = run_simulation(
         pendulum, t_span, dt, x0, tau_values, t_eval=t_full
     )
 
-    if len(time_points) == 0: 
+    if len(time_points) == 0:
         return pd.DataFrame({'time': [], 'theta': [], 'theta_dot': [], 'tau': []})
 
-    # 将力矩值与实际输出时间对齐
+    # Align torque values with actual output times from the solver
     set_global_torque_params(tau_values, t_span[0], dt)
     tau_at_output_times = [get_tau_at_time_global(t) for t in time_points]
     set_global_torque_params(None, 0, config.DT)
 
-    # 创建数据框
+    # Create DataFrame
     data = {
-        'time': time_points, 
-        'theta': theta_values, 
-        'theta_dot': theta_dot_values, 
+        'time': time_points,
+        'theta': theta_values,
+        'theta_dot': theta_dot_values,
         'tau': tau_at_output_times
     }
     df = pd.DataFrame(data)
-    
-    # 检查数据质量
-    if df.isnull().values.any() or np.isinf(df.drop('time', axis=1)).values.any(): 
+
+    # Check data quality
+    if df.isnull().values.any() or np.isinf(df.drop('time', axis=1)).values.any():
         print("Warning: Simulation resulted in NaN or Inf values.")
-    
+
     return df
 
-
-# --- RK4 Step Function (保持不变) ---
+# --- RK4 Step Function (can be used for alternative integration) ---
 def rk4_step(pendulum, state_t, tau_t, dt):
     """ Performs a single RK4 integration step. """
-    # ... (内容不变) ...
-    t_dummy = 0
+    t_dummy = 0 # Time argument is not used in this specific ODE formulation
     try:
-        k1 = pendulum.ode(t_dummy, state_t,       current_tau=tau_t); k2 = pendulum.ode(t_dummy, state_t + 0.5*dt*k1, current_tau=tau_t); k3 = pendulum.ode(t_dummy, state_t + 0.5*dt*k2, current_tau=tau_t); k4 = pendulum.ode(t_dummy, state_t + dt*k3,     current_tau=tau_t)
+        # Calculate RK4 terms
+        k1 = pendulum.ode(t_dummy, state_t,       current_tau=tau_t)
+        k2 = pendulum.ode(t_dummy, state_t + 0.5*dt*k1, current_tau=tau_t)
+        k3 = pendulum.ode(t_dummy, state_t + 0.5*dt*k2, current_tau=tau_t)
+        k4 = pendulum.ode(t_dummy, state_t + dt*k3,     current_tau=tau_t)
+        # Combine terms for the next state
         state_t_plus_dt = state_t + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-        if not np.all(np.isfinite(state_t_plus_dt)): print(f"Warning: NaN/Inf detected during RK4 step."); return np.array([np.nan, np.nan])
+        # Check for invalid results
+        if not np.all(np.isfinite(state_t_plus_dt)):
+            print(f"Warning: NaN/Inf detected during RK4 step.")
+            return np.array([np.nan, np.nan]) # Return NaN state
         return state_t_plus_dt
-    except Exception as e: print(f"Error during RK4 step calculation: {e}"); return np.array([np.nan, np.nan])
+    except Exception as e:
+        print(f"Error during RK4 step calculation: {e}")
+        return np.array([np.nan, np.nan]) # Return NaN state on error
 
