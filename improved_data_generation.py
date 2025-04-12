@@ -750,23 +750,34 @@ def generate_optimized_simulation_data(pendulum, initial_conditions,
     
     def process_simulation(i, x0):
         """为单组初始条件生成仿真数据"""
+        print(f"  [process_simulation] 开始处理仿真 {i+1}/{num_simulations}, 初始条件: {x0}")
+        
         try:
             # Handle different IC formats
             if len(x0) == 2:
                 theta0, theta_dot0 = x0
                 tau_value = np.random.uniform(config.TORQUE_RANGE[0], config.TORQUE_RANGE[1])
-                print(f"  生成模拟 {i+1}/{num_simulations} (IC: [{theta0:.3f}, {theta_dot0:.3f}, {tau_value:.3f}] - random tau)...")
+                print(f"  [process_simulation] 生成模拟 {i+1}/{num_simulations} (IC: [{theta0:.3f}, {theta_dot0:.3f}, {tau_value:.3f}] - random tau)...")
             elif len(x0) == 3:
                 theta0, theta_dot0, tau_value = x0
-                print(f"  生成模拟 {i+1}/{num_simulations} (IC: [{theta0:.3f}, {theta_dot0:.3f}, {tau_value:.3f}])...")
+                print(f"  [process_simulation] 生成模拟 {i+1}/{num_simulations} (IC: [{theta0:.3f}, {theta_dot0:.3f}, {tau_value:.3f}])...")
             else:
-                print(f"  生成模拟 {i+1}/{num_simulations} (IC: 初始条件数量错误，预期2个或3个值)...")
+                print(f"  [process_simulation] 生成模拟 {i+1}/{num_simulations} (IC: 初始条件数量错误，预期2个或3个值)...")
                 return pd.DataFrame()
         except (TypeError, ValueError) as e:
-            print(f"  Error in simulation {i+1}: Initial conditions are missing, {e}")
+            print(f"  [process_simulation] Error in simulation {i+1}: Initial conditions are missing, {e}")
             return pd.DataFrame()
+        
+        if len(x0) != 3:
+             print(f"  [process_simulation] initial_conditions length error: {len(x0)}, expected 3.")
 
-        if len(x0) == 0:
+        if len(x0) < 2:
+            print(f"  [process_simulation] Initial condition error, x0 is not valid.")
+            return pd.DataFrame()
+        
+        if len(x0) == 2:
+            theta0, theta_dot0 = x0
+            tau_value = np.random.uniform(config.TORQUE_RANGE[0], config.TORQUE_RANGE[1])
             return pd.DataFrame()
         theta0, theta_dot0, tau_value = x0
         
@@ -775,6 +786,7 @@ def generate_optimized_simulation_data(pendulum, initial_conditions,
         return pd.DataFrame()
             
         # 使用恒定的力矩值
+        print(f"  [process_simulation] 调用 run_simulation: pendulum={pendulum}, t_span={t_span}, dt={dt}, [theta0, theta_dot0]=[{theta0}, {theta_dot0}], tau_values={tau_values}, t_eval=t_full")
         tau_values = np.full_like(t_full, tau_value)
         
         # 运行仿真
@@ -782,7 +794,11 @@ def generate_optimized_simulation_data(pendulum, initial_conditions,
             pendulum, t_span, dt, [theta0, theta_dot0], tau_values, t_eval=t_full
         )
 
-        if len(time_points) == 0: 
+        if len(time_points) == 0:
+            print(f"  [process_simulation] run_simulation 返回空结果。")
+            return pd.DataFrame()
+        
+        if np.isnan(time_points).any() or np.isnan(theta_values).any() or np.isnan(theta_dot_values).any() or np.isnan(tau_values).any() or np.isinf(time_points).any() or np.isinf(theta_values).any() or np.isinf(theta_dot_values).any() or np.isinf(tau_values).any():
             return pd.DataFrame()
 
         # 将力矩值与实际输出时间对齐
@@ -801,10 +817,16 @@ def generate_optimized_simulation_data(pendulum, initial_conditions,
         
         # 检查数据质量
         if df.isnull().values.any() or np.isinf(df.drop('time', axis=1)).values.any(): 
-            print(f"警告: 模拟 {i+1} 生成的数据包含NaN或Inf值")
+            print(f"  [process_simulation] 警告: 模拟 {i+1} 生成的数据包含NaN或Inf值")
+            print(df)
             return pd.DataFrame()
         
+        
+        print(f"  [process_simulation] 完成处理仿真 {i+1}/{num_simulations}, 返回数据帧")
+        
+        
         return df
+        
     
     # 并行运行所有仿真
     print(f"使用并行处理生成 {num_simulations} 组仿真数据...")
@@ -815,7 +837,11 @@ def generate_optimized_simulation_data(pendulum, initial_conditions,
     
     # 收集结果并计算边界
     for df in results:
+        if df.empty: print(f"Empty Dataframe found!")
         if not df.empty:
+            pass
+        else:
+            print(f"  [generate_optimized_simulation_data] 警告: 收到空的数据帧")
             all_dfs.append(df)
             total_rows += len(df)
             boundaries.append(total_rows)
@@ -861,7 +887,7 @@ def generate_improved_dataset(target_sequences=config.TARGET_SEQUENCES, dt=confi
     
     # 2. 计算需要的模拟数量 (增加20%余量)
     simulations_needed = int(target_sequences / sequences_per_simulation * 1.2)
-    print(f"每次模拟约能生成 {sequences_per_simulation} 个序列，需要约 {simulations_needed} 次模拟")
+    print(f"每次模拟约能生成 {sequences_per_simulation} 个序列，需要约 {simulations_needed} 次模拟")    
     
     # 3. 生成多样化的初始条件
     print("生成多样化的初始条件...")
@@ -896,7 +922,7 @@ def generate_improved_dataset(target_sequences=config.TARGET_SEQUENCES, dt=confi
            physics_samples_count, pendulum
        )
        physics_ics = [[theta_samples[i], theta_dot_samples[i], torque_samples[i]] for i in range(len(theta_samples))]
-    else:
+    else:      
         physics_ics = []
     
     # 3.4 合并所有初始条件
@@ -917,6 +943,7 @@ def generate_improved_dataset(target_sequences=config.TARGET_SEQUENCES, dt=confi
     print(f"合并 {len(all_dfs)} 组模拟数据...")
     df_all = pd.concat(all_dfs, ignore_index=True)
     
+    
     # 7. 保存合并的数据
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -933,8 +960,6 @@ def generate_improved_dataset(target_sequences=config.TARGET_SEQUENCES, dt=confi
     elapsed_time = time.time() - start_time
     print(f"数据生成总耗时: {elapsed_time:.2f} 秒")
     
-    # 9. 返回合并的数据和模拟边界
-    return df_all, boundaries
 
 
 # --- 用于验证生成数据多样性和质量的函数 ---
@@ -1131,7 +1156,7 @@ if __name__ == "__main__":
     if force_regenerate or not os.path.exists(config.COMBINED_DATA_FILE):
         df_all, boundaries = generate_improved_dataset(
             target_sequences=config.TARGET_SEQUENCES,
-            dt=config.DT,
+            dt=config.DT, 
             t_span=config.T_SPAN,
             output_file=config.COMBINED_DATA_FILE
         )
