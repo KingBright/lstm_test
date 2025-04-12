@@ -48,12 +48,12 @@ INITIAL_CONDITIONS_SPECIFIC = [
 
 # 优化的数据生成策略参数
 # 目标序列总数约100,000
-TARGET_SEQUENCES = 200000
+TARGET_SEQUENCES = 1000000
 # 角度和角速度范围参数 (用于随机初始条件)
 THETA_RANGE = [-np.pi/3, np.pi/3]  # 角度范围 [-90°, 90°]
 THETA_DOT_RANGE = [-0.5, 0.5]      # 角速度范围 [-2, 2] rad/s
 # 随机初始条件数量 (将会根据目标序列数自动计算)
-NUM_RANDOM_ICS = 1000  # 默认值，会根据总序列需求自动调整
+NUM_RANDOM_ICS = 5000  # 默认值，会根据总序列需求自动调整
 
 # Torque 参数设置
 TORQUE_TYPE = "highly_random"
@@ -73,7 +73,7 @@ MODELS_DIR = 'models'; FIGURES_DIR = 'figures'
 PLOT_SCENARIO_DATA = False # Plotting individual scenarios less relevant now
 
 # --- Preprocessing Parameters ---
-INPUT_SEQ_LEN = 10; OUTPUT_SEQ_LEN = 5
+INPUT_SEQ_LEN = 20; OUTPUT_SEQ_LEN = 2
 # VALIDATION_SPLIT for chronological splitting of sequences
 VALIDATION_SPLIT = 0.2 # <<<--- 确认 VALIDATION_SPLIT 已定义 (用于时序分割)
 MIN_PREDICTION_STEPS = 50
