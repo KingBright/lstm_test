@@ -1,9 +1,0 @@
-错误: cannot unpack non-iterable NoneType object
-错误类型: TypeError
-Traceback (most recent call last):
-  File "/Users/jinliang/Workspace/apps/LSTM_demo/run_optimized.py", line 136, in run_experiment_with_performance_tracking
-    main_experiment.run_experiment()
-  File "/Users/jinliang/Workspace/apps/LSTM_demo/main_experiment.py", line 123, in run_experiment
-    df_all, simulation_boundaries = generate_improved_dataset(
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: cannot unpack non-iterable NoneType object
