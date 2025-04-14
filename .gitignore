@@ -4,3 +4,4 @@ models
 data
 performance_log.txt
 error_log.txt
+.vscode
