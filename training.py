@@ -8,7 +8,6 @@ import time
 import os
 import numpy as np
 import config
-# from model import PureLSTM, PureGRU # Not needed directly
 
 def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
                 learning_rate=config.LEARNING_RATE, device=None,
@@ -19,151 +18,139 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
                 model_save_path=config.MODEL_BEST_PATH,
                 final_model_info_path=config.MODEL_FINAL_PATH):
     """
-    训练指定的神经网络模型（适用于单步或 Seq2Seq 输出）。
-    使用余弦退火学习率调度器并添加学习率预热。
+    Trains the model with diagnostics for model output vs target and gradient norms.
+    Uses ReduceLROnPlateau scheduler. Corrected gradient printing for final layer.
     """
     start_time = time.time()
-
-    # 确定设备
     if device is None:
         if torch.backends.mps.is_available(): device = torch.device("mps"); print("使用 MPS 加速进行训练。")
         elif torch.cuda.is_available(): device = torch.device("cuda"); print("使用 CUDA 加速进行训练。")
         else: device = torch.device("cpu"); print("使用 CPU 进行训练。")
     model.to(device)
-
-    # 确保目录存在
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
 
-    # 计算参数量
     try: total_params = sum(p.numel() for p in model.parameters() if p.requires_grad); print(f"模型可训练参数数量: {total_params:,}")
     except Exception as e: print(f"无法计算模型参数: {e}")
 
-    # 损失函数
     criterion = nn.MSELoss()
-
-    # 优化器
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, patience=scheduler_patience, verbose=True, threshold=1e-4, min_lr=1e-7)
+    print(f"学习率调度: 使用 ReduceLROnPlateau (factor={scheduler_factor}, patience={scheduler_patience})")
 
-    # 学习率调度器 - 使用余弦退火+预热
-    # 计算总步数和预热步数
-    total_steps = len(train_loader) * num_epochs
-    warmup_steps = len(train_loader) * 5  # 预热5个周期
-    
-    # 创建余弦退火调度器函数
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            # 线性预热
-            return float(current_step) / float(max(1, warmup_steps))
-        
-        # 预热后使用余弦衰减
-        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
-        
-        # 确保不低于最小学习率
-        min_lr_factor = 1e-6 / learning_rate  # 最小学习率为初始学习率的百万分之一
-        return max(min_lr_factor, cosine_decay)
-    
-    # 创建调度器
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    print(f"学习率调度: 使用余弦退火+预热(预热{warmup_steps}步，总计{total_steps}步)")
-
-    # 检查 DataLoader
     train_loader_len = 0; val_loader_len = 0
     try:
          train_loader_len = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else len(train_loader)
          val_loader_len = len(val_loader.dataset) if val_loader and hasattr(val_loader, 'dataset') else (len(val_loader) if val_loader else 0)
          if train_loader_len == 0: print("错误: 训练数据集为空。"); return [], [], 0
          if val_loader_len == 0: print("警告: 验证数据集为空。")
-    except (TypeError, AttributeError) as e: print(f"错误: 无法确定数据集长度: {e}。"); return [], [], 0
+    except Exception as e: print(f"错误: 无法确定数据集长度: {e}。"); return [], [], 0
 
-    # 初始化训练循环变量
     best_val_loss = float('inf'); best_epoch = 0; early_stopping_counter = 0
     train_losses = []; val_losses = []
-    # 初始化学习率变量用于比较
-    current_lr = learning_rate
-    prev_lr = current_lr
-    global_step = 0  # 跟踪总步数
-
     print(f"开始训练，最多 {num_epochs} 个周期...")
     epochs_ran = 0
+    diag_print_freq = 100 # Frequency to print diagnostics
+
     for epoch in range(num_epochs):
         epochs_ran = epoch + 1
         epoch_start_time = time.time()
-        # 记录当前周期的起始学习率
         prev_lr = optimizer.param_groups[0]['lr']
 
-        # --- 训练阶段 (针对M2 Max优化) ---
+        # --- Training Phase ---
         model.train()
         running_train_loss = 0.0
         train_batches = 0
-        
-        # 设置较大的批次大小进行梯度累积
-        grad_accumulation_steps = 1  # 默认为1，可根据内存情况调整
-        
-        for inputs, targets in train_loader:
-            # 更新全局步数
-            global_step += 1
-            
-            # 使用 non_blocking=True 加速数据传输
+        grad_accumulation_steps = 1
+
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            
-            # 仅在需要时清零梯度
-            if train_batches % grad_accumulation_steps == 0:
-                optimizer.zero_grad()
-                
+
+            # --- Forward pass ---
             try:
-                # 前向传播和损失计算
+                if grad_accumulation_steps == 1: optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                
-                # 如果使用梯度累积，则缩放损失
-                if grad_accumulation_steps > 1:
-                    loss = loss / grad_accumulation_steps
-            except Exception as e:
-                print(f"训练前向/损失计算错误: {e}")
-                return train_losses, val_losses, 0
-                
-            if not torch.isfinite(loss):
-                print(f"错误: 训练周期 {epoch+1} 损失 NaN/Inf。")
-                return train_losses, val_losses, 0
-                
+                if grad_accumulation_steps > 1: loss = loss / grad_accumulation_steps
+            except Exception as e: print(f"训练前向/损失计算错误 (周期 {epoch+1}): {e}"); return train_losses, val_losses, 0
+            if not torch.isfinite(loss): print(f"错误: 训练周期 {epoch+1} 损失 NaN/Inf。"); return train_losses, val_losses, 0
+
+            # --- Backward pass ---
             try:
-                # 反向传播
-                loss.backward()
-                
-                # 仅在累积步骤结束时更新参数
-                if (train_batches + 1) % grad_accumulation_steps == 0 or (train_batches + 1) == len(train_loader):
-                    # 梯度裁剪以提高稳定性
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                loss.backward() # Calculate gradients
+            except Exception as e: print(f"训练反向传播错误 (周期 {epoch+1}): {e}"); return train_losses, val_losses, 0
+
+
+            # --- Diagnostics (Print Outputs, Targets, Gradients) ---
+            print_diagnostics = (epoch == 0 or (epoch + 1) % 10 == 0) and batch_idx % diag_print_freq == 0
+            if print_diagnostics:
+                print(f"\n--- DIAGNOSTIC [Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}/{len(train_loader)}] ---")
+                print(f"  Outputs shape: {outputs.shape}, Targets shape: {targets.shape}")
+                k_print = min(getattr(config, 'OUTPUT_SEQ_LEN', 5), 5)
+                # Use .item() for single loss value, ensure grad_accumulation_steps is handled if > 1
+                current_loss_item = loss.item() * grad_accumulation_steps if grad_accumulation_steps > 1 else loss.item()
+                print(f"  Targets (Scaled, Sample 0, Steps 0-{k_print-1}):\n{targets[0, :k_print, :].detach().cpu().numpy()}")
+                print(f"  Outputs (Scaled, Sample 0, Steps 0-{k_print-1}):\n{outputs[0, :k_print, :].detach().cpu().numpy()}")
+                print(f"  Loss (this batch): {current_loss_item:.6f}")
+
+                # --- Gradient Norm Diagnostics ---
+                print(f"  --- Gradient Norms (L2) ---")
+                total_model_grad_norm = 0.0
+                try:
+                    # Iterate through named parameters to identify layers
+                    for name, p in model.named_parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2).item()
+                            total_model_grad_norm += param_norm ** 2
+                            # Print norms for specific layers of interest
+                            # Use startswith for more robustness against bidirectional prefixes etc.
+                            if name.startswith('lstm1.') or name.startswith('gru1.'):
+                                print(f"    {name}: {param_norm:.6e}")
+                            elif name.startswith('lstm2.') or name.startswith('gru2.'):
+                                print(f"    {name}: {param_norm:.6e}")
+                            # *** FIXED: Check final linear layer in mlp_output_layer by index ***
+                            elif name.startswith('mlp_output_layer.2.'): # Assuming final Linear is index 2 in Sequential
+                                print(f"    {name} (Final Linear): {param_norm:.6e}")
+                            # Optionally print other layers like mlp_input_layer or res_blocks
+                            # elif name.startswith('mlp_input_layer.'):
+                            #      print(f"    {name}: {param_norm:.6e}")
+                            # elif name.startswith('res_block'):
+                            #      print(f"    {name}: {param_norm:.6e}")
+
+                    total_model_grad_norm = total_model_grad_norm ** 0.5
+                    print(f"    Total Model Grad Norm: {total_model_grad_norm:.6e}")
+                except Exception as grad_e:
+                    print(f"    Error calculating gradient norms: {grad_e}")
+                print(f"  ---------------------------")
+                # --- END OF GRADIENT PRINTS ---
+                print(f"----------------------------------------------------")
+
+
+            # --- Optimizer Step ---
+            try:
+                # Apply gradient clipping BEFORE optimizer step
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                if (batch_idx + 1) % grad_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                     optimizer.step()
-                    
-                    # 每批次更新学习率
-                    scheduler.step()
-            except Exception as e:
-                print(f"训练反向/优化器错误: {e}")
-                return train_losses, val_losses, 0
-                
-            running_train_loss += loss.item() * (1 if grad_accumulation_steps == 1 else grad_accumulation_steps)
+                    # Zero gradients AFTER stepping if accumulating or standard training
+                    optimizer.zero_grad()
+
+            except Exception as e: print(f"优化器步骤错误 (周期 {epoch+1}): {e}"); return train_losses, val_losses, 0
+
+            running_train_loss += current_loss_item # Use the item loss
             train_batches += 1
-            
-            # 每100步打印一次学习率
-            if global_step % 100 == 0:
-                print(f"  步骤 {global_step}/{total_steps}, 当前学习率: {optimizer.param_groups[0]['lr']:.6e}")
-            
-        # 如果是MPS设备，添加同步点确保所有操作完成
-        if device.type == 'mps':
-            torch.mps.synchronize()
+
+        if device.type == 'mps': torch.mps.synchronize()
         epoch_train_loss = running_train_loss / train_batches if train_batches > 0 else 0
         train_losses.append(epoch_train_loss)
 
-        # --- 验证阶段 ---
+        # --- Validation Phase ---
         model.eval(); running_val_loss = 0.0; val_batches = 0; epoch_val_loss = float('nan')
         if val_loader is not None and val_loader_len > 0:
              with torch.no_grad():
                   for inputs, targets in val_loader:
-                       inputs, targets = inputs.to(device), targets.to(device)
+                       inputs = inputs.to(device, non_blocking=True); targets = targets.to(device, non_blocking=True)
                        try: outputs = model(inputs); loss = criterion(outputs, targets)
                        except Exception as e: print(f"验证前向/损失计算错误: {e}"); running_val_loss = float('nan'); break
                        if not torch.isfinite(loss): print(f"警告: 验证周期 {epoch+1} 损失 NaN/Inf。"); running_val_loss = float('nan'); break
@@ -171,51 +158,56 @@ def train_model(model, train_loader, val_loader, num_epochs=config.NUM_EPOCHS,
              if val_batches > 0 and np.isfinite(running_val_loss): epoch_val_loss = running_val_loss / val_batches
              else: epoch_val_loss = float('nan')
              val_losses.append(epoch_val_loss)
-             # 不再使用ReduceLROnPlateau调度器，所以这里不需要scheduler.step()
+             if np.isfinite(epoch_val_loss): scheduler.step(epoch_val_loss)
+             else: print(f"警告: 周期 {epoch+1} 验证损失无效，跳过 LR 调度器步骤。")
         else: val_losses.append(float('nan'))
 
-        # --- 日志记录 ---
-        epoch_time = time.time() - epoch_start_time
-        current_lr = optimizer.param_groups[0]['lr'] # 获取当前学习率
-        # +++ 手动检查并打印学习率变化 +++
-        if abs(current_lr - prev_lr) > 1e-8:  # 如果学习率变化超过阈值
-             print(f"  学习率在周期 {epoch+1} 结束时变化: {prev_lr:.6e} -> {current_lr:.6e}")
-        # +++ 检查结束 +++
-        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == num_epochs - 1:
-            val_loss_str = f"{epoch_val_loss:.6f}" if np.isfinite(epoch_val_loss) else "N/A"
-            print(f'周期 [{epoch+1}/{num_epochs}], 训练损失: {epoch_train_loss:.6f}, 验证损失: {val_loss_str}, 耗时: {epoch_time:.2f}s, 学习率: {current_lr:.6e}')
+        # --- Logging & Early Stopping ---
+        epoch_time = time.time() - epoch_start_time; current_lr = optimizer.param_groups[0]['lr']
+        val_loss_str = f"{epoch_val_loss:.6f}" if np.isfinite(epoch_val_loss) else "N/A"
+        print(f'周期 [{epoch+1}/{num_epochs}], 训练损失: {epoch_train_loss:.6f}, 验证损失: {val_loss_str}, 耗时: {epoch_time:.2f}s, 学习率: {current_lr:.6e}')
 
-        # --- 早停和保存最佳模型 ---
-        # ... (早停逻辑保持不变) ...
         if np.isfinite(epoch_val_loss):
-            if epoch_val_loss < best_val_loss:
+            if epoch_val_loss < best_val_loss - 1e-5:
                 best_val_loss = epoch_val_loss; best_epoch = epoch + 1
                 try: torch.save(model.state_dict(), model_save_path); early_stopping_counter = 0
                 except Exception as e: print(f"  -> 保存最佳模型时出错: {e}")
             else:
                 early_stopping_counter += 1
-                if early_stopping_counter >= early_stopping_patience: print(f"基于验证损失，在周期 {epoch + 1} 触发早停。最佳周期为 {best_epoch}。"); break
-        elif val_loader_len == 0 and epoch > early_stopping_patience:
-             if epoch > early_stopping_patience + 5 and len(train_losses) > 5 and all(abs(train_losses[-1] - tl) < 1e-6 for tl in train_losses[-5:-1]):
-                  print(f"由于训练损失平稳（无验证数据），在周期 {epoch+1} 提前停止。"); break
+                if early_stopping_counter >= early_stopping_patience:
+                    print(f"触发早停 (Patience: {early_stopping_patience}). 最佳周期: {best_epoch}."); break
+        elif val_loader_len == 0 and epoch > 0:
+             stagnation_patience = early_stopping_patience
+             if epoch > stagnation_patience and len(train_losses) > stagnation_patience:
+                  recent_losses = train_losses[-stagnation_patience:]
+                  if all(abs(recent_losses[0] - tl) < 1e-5 for tl in recent_losses):
+                       print(f"由于训练损失平稳（无验证数据），在周期 {epoch+1} 提前停止。"); break
 
-
-    # --- 训练后处理 ---
-    # ... (后处理逻辑保持不变, 包括保存 final_model_info) ...
+    # --- Post-Training ---
     total_time = time.time() - start_time; print(f"\n训练完成。总耗时: {total_time:.2f}s")
-    final_model_info = { 'best_epoch': best_epoch, 'best_val_loss': best_val_loss if np.isfinite(best_val_loss) else None, 'model_type': config.MODEL_TYPE, 'final_epoch_ran': epochs_ran, 'learning_rate': learning_rate, 'weight_decay': weight_decay, 'batch_size': config.BATCH_SIZE, 'input_sequence_length': config.INPUT_SEQ_LEN, 'output_sequence_length': config.OUTPUT_SEQ_LEN }
+    final_model_info = { 'best_epoch': best_epoch if best_epoch > 0 else epochs_ran, 'best_val_loss': best_val_loss if np.isfinite(best_val_loss) else None,'final_train_loss': epoch_train_loss if np.isfinite(epoch_train_loss) else None, 'model_type': config.MODEL_TYPE, 'final_epoch_ran': epochs_ran, 'learning_rate': learning_rate, 'weight_decay': weight_decay, 'batch_size': config.BATCH_SIZE, 'input_sequence_length': config.INPUT_SEQ_LEN, 'output_sequence_length': config.OUTPUT_SEQ_LEN, 'predict_delta': config.PREDICT_DELTA, 'use_sincos': config.USE_SINCOS_THETA, 'predict_sincos_output': config.PREDICT_SINCOS_OUTPUT }
+    best_model_loaded = False
     if best_epoch > 0 and os.path.exists(model_save_path):
         print(f"加载来自周期 {best_epoch} 的最佳模型状态...");
-        try: model.load_state_dict(torch.load(model_save_path)); print(f"最佳模型验证损失: {best_val_loss:.6f}"); final_model_info['model_state_dict'] = model.state_dict()
-        except Exception as e: print(f"加载最佳模型状态时出错: {e}"); print("将保存最终状态。"); final_model_info['model_state_dict'] = model.state_dict(); best_epoch = 0; final_model_info['comment'] = "加载最佳状态失败，保存的是最终状态。"
+        try:
+            if device.type == 'mps': state_dict = torch.load(model_save_path, map_location='mps', weights_only=True)
+            else: state_dict = torch.load(model_save_path, map_location=device, weights_only=True)
+            model.load_state_dict(state_dict); print(f"最佳模型验证损失: {best_val_loss:.6f}"); final_model_info['comment'] = f"Loaded best model from epoch {best_epoch}"; best_model_loaded = True
+        except Exception as e: print(f"加载最佳模型状态时出错: {e}"); print("将保存最终状态。"); final_model_info['comment'] = "Failed to load best state, saved final state."
     else:
-        if best_epoch == 0 and val_loader_len > 0: print("验证损失未改善。")
+        if best_epoch == 0 and val_loader_len > 0: print("验证损失未改善或无验证集。")
         elif best_epoch > 0: print(f"警告: 找不到最佳模型文件 {model_save_path}。")
-        print("将保存训练结束时的模型状态。"); final_model_info['model_state_dict'] = model.state_dict()
+        print("将保存训练结束时的模型状态。"); final_model_info['comment'] = "Saved final model state."
     try:
+        final_model_info['model_state_dict'] = model.state_dict()
         current_params = config.get_current_model_params(); input_size_saved = 'unknown'; output_size_saved = 'unknown'
         if hasattr(model, 'input_norm') and isinstance(model.input_norm, nn.LayerNorm): input_size_saved = model.input_norm.normalized_shape[0]
-        if hasattr(model, 'output_net') and isinstance(model.output_net, nn.Sequential) and len(model.output_net) > 0 and isinstance(model.output_net[-1], nn.Linear): output_size_saved = model.output_net[-1].out_features // config.OUTPUT_SEQ_LEN # Save per-step size
+        if hasattr(model, 'mlp_output_layer') and isinstance(model.mlp_output_layer, nn.Sequential) and len(model.mlp_output_layer) > 0:
+             final_linear = model.mlp_output_layer[-1] # Get last layer of output sequential
+             if isinstance(final_linear, nn.Linear):
+                 output_features_per_step = 3 if config.PREDICT_SINCOS_OUTPUT else 2
+                 if final_linear.out_features != config.OUTPUT_SEQ_LEN * output_features_per_step: print(f"Warning: Model output layer size mismatch.")
+                 output_size_saved = output_features_per_step
         final_model_info.update({ 'input_size': input_size_saved, 'hidden_size': current_params.get('hidden_size', 'unknown'), 'num_layers': current_params.get('num_layers', 'unknown'), 'output_size': output_size_saved, 'dense_units': current_params.get('dense_units', 'unknown'), 'dropout_rate': current_params.get('dropout_rate', 'unknown') })
         torch.save(final_model_info, final_model_info_path); print(f"最终模型信息已保存到 {final_model_info_path}")
     except Exception as e: print(f"保存最终模型信息时出错: {e}")

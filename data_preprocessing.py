@@ -3,8 +3,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-# train_test_split is used here ONLY for shuffling the training set if needed
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split # Only for shuffling train set
 import joblib
 import torch
 from torch.utils.data import TensorDataset, DataLoader
@@ -12,135 +11,111 @@ import os
 import time
 import config # Import config
 
-# create_sequences remains the same (handles Seq2Seq output shape and SinCos features)
-def create_sequences(data, simulation_boundaries=None, input_seq_len=config.INPUT_SEQ_LEN, output_seq_len=config.OUTPUT_SEQ_LEN, use_sincos=config.USE_SINCOS_THETA):
+# --- Sequence Creation (Handles Absolute/Delta/SinCos Prediction) ---
+def create_sequences(data, simulation_boundaries=None,
+                     input_seq_len=config.INPUT_SEQ_LEN,
+                     output_seq_len=config.OUTPUT_SEQ_LEN,
+                     use_sincos=config.USE_SINCOS_THETA,
+                     predict_delta=config.PREDICT_DELTA,
+                     predict_sincos_output=config.PREDICT_SINCOS_OUTPUT):
     """
-    Creates input sequences and corresponding multi-step target sequences (Seq2Seq).
-    Input features can be [theta, theta_dot, tau] or [sin(theta), cos(theta), theta_dot, tau].
-    Target 'y' will be absolute states for the next 'output_seq_len' steps.
-    
-    Args:
-        data: 包含所有数据的数组
-        simulation_boundaries: 指示不同模拟边界的索引列表，None表示单一模拟
-        input_seq_len: 输入序列长度
-        output_seq_len: 输出序列长度
-        use_sincos: 是否使用sin/cos特征
-        
-    Returns:
-        X: 输入序列数组
-        y: 目标序列数组
+    Creates input sequences and corresponding target sequences.
+    Targets 'y' can be [theta, dot], [delta_theta, delta_dot], or [sin, cos, dot].
     """
     X, y = [], []
-    if data.shape[1] < 3: print(f"Error: Data needs at least 3 features."); return np.empty((0, input_seq_len, data.shape[1])), np.empty((0, output_seq_len, 2))
-    num_input_features = 4 if use_sincos else 3; num_output_features = 2
-    total_len_needed = input_seq_len + output_seq_len
-    if len(data) < total_len_needed: print(f"Warning: Data length ({len(data)}) < {total_len_needed}."); return np.empty((0, input_seq_len, num_input_features)), np.empty((0, output_seq_len, num_output_features))
+    required_cols = 3
+    if predict_sincos_output: output_cols = 3
+    elif predict_delta: output_cols = 2
+    else: output_cols = 2
 
-    # 如果没有提供模拟边界，则假设所有数据是单一模拟
+    if data.shape[1] < required_cols: print(f"Error: Data needs at least {required_cols} features."); return np.empty((0,)), np.empty((0,))
+    num_input_features = 4 if use_sincos else 3
+    total_len_needed = input_seq_len + output_seq_len
+
+    if len(data) < total_len_needed: print(f"Warning: Data length ({len(data)}) < total steps needed ({total_len_needed})."); return np.empty((0,)), np.empty((0,))
+
     if simulation_boundaries is None:
+        print("Warning: No simulation boundaries provided. Treating data as single sequence.")
         simulation_boundaries = [0, len(data)]
     else:
-        # 确保边界列表以0开始，以数据长度结束
-        if simulation_boundaries[0] != 0:
-            simulation_boundaries = [0] + simulation_boundaries
-        if simulation_boundaries[-1] != len(data):
-            simulation_boundaries.append(len(data))
-    
-    # 针对每个模拟段落创建序列
+        if not simulation_boundaries or simulation_boundaries[0] != 0: simulation_boundaries = [0] + (simulation_boundaries if simulation_boundaries else [])
+        if simulation_boundaries[-1] != len(data): simulation_boundaries.append(len(data))
+    simulation_boundaries = sorted(list(set(simulation_boundaries)))
+
+    # print(f"Creating sequences (Delta: {predict_delta}, SinCosOut: {predict_sincos_output})...") # Less verbose
+    sequences_created = 0
     for sim_idx in range(len(simulation_boundaries) - 1):
-        start_idx = simulation_boundaries[sim_idx]
-        end_idx = simulation_boundaries[sim_idx + 1]
-        
-        # 确保这个模拟段有足够的数据点生成序列
-        if end_idx - start_idx < total_len_needed:
-            continue
-            
-        # 在当前模拟段内创建序列
+        start_idx = simulation_boundaries[sim_idx]; end_idx = simulation_boundaries[sim_idx + 1]
+        segment_len = end_idx - start_idx
+        if segment_len < total_len_needed: continue
+
         for i in range(start_idx, end_idx - total_len_needed + 1):
             input_window = data[i : i + input_seq_len]
-            target_window = data[i + input_seq_len : i + input_seq_len + output_seq_len]
+            target_window_abs = data[i + input_seq_len : i + input_seq_len + output_seq_len]
+
             theta_in = input_window[:, 0]; theta_dot_in = input_window[:, 1]; tau_in = input_window[:, 2]
             if use_sincos: input_seq = np.stack([np.sin(theta_in), np.cos(theta_in), theta_dot_in, tau_in], axis=1)
             else: input_seq = np.stack([theta_in, theta_dot_in, tau_in], axis=1)
-            target_seq = target_window[:, 0:num_output_features] # Absolute states
-            X.append(input_seq); y.append(target_seq)
 
-    if not X: return np.empty((0, input_seq_len, num_input_features)), np.empty((0, output_seq_len, num_output_features))
+            if predict_sincos_output:
+                theta_target = target_window_abs[:, 0]; theta_dot_target = target_window_abs[:, 1]
+                target_seq = np.stack([np.sin(theta_target), np.cos(theta_target), theta_dot_target], axis=1)
+            elif predict_delta:
+                last_input_state = input_window[-1, 0:2]; states_for_diff = np.vstack([last_input_state, target_window_abs[:, 0:2]])
+                target_seq = np.diff(states_for_diff, axis=0)
+            else: target_seq = target_window_abs[:, 0:2]
+
+            X.append(input_seq); y.append(target_seq); sequences_created += 1
+
+    # print(f"Total sequences created: {sequences_created}") # Less verbose
+    if not X: return np.empty((0, input_seq_len, num_input_features)), np.empty((0, output_seq_len, output_cols))
     return np.array(X), np.array(y)
 
 
-# --- NEW Core Function for Time-Split Data Prep (Seq2Seq) with Simulation Boundaries ---
-def prepare_timesplit_seq2seq_data(df_all, simulation_boundaries=None, input_sequence_length=config.INPUT_SEQ_LEN,
+# --- Data Preparation (ADDED TARGET SCALED STATS PRINT) ---
+def prepare_timesplit_seq2seq_data(df_all, simulation_boundaries=None,
+                                   input_sequence_length=config.INPUT_SEQ_LEN,
                                    output_sequence_length=config.OUTPUT_SEQ_LEN,
                                    val_split_ratio=config.VALIDATION_SPLIT,
                                    seed=config.SEED):
     """
-    Prepares training and validation DataLoaders from a single combined DataFrame
-    using a chronological split for train/validation sets. Handles Seq2Seq targets.
-    Respects simulation boundaries to prevent mixing data from different initial conditions.
-
-    Args:
-        df_all (pd.DataFrame): DataFrame containing all combined simulation data.
-        simulation_boundaries (list): 指示不同模拟边界的行索引列表.
-        input_sequence_length (int): Length of input sequences (N).
-        output_sequence_length (int): Length of output sequences (K).
-        val_split_ratio (float): Proportion of total sequences for the validation set.
-        seed (int): Random seed for shuffling the training set.
-
-    Returns:
-        tuple: (train_loader, val_loader, input_scaler, target_scaler)
-               Returns (None, None, None, None) if processing fails.
+    Prepares training and validation DataLoaders using a chronological split.
+    Handles scaling and prints statistics of scaled targets.
     """
-    print(f"Preparing time-split train/validation data (Val split ratio: {val_split_ratio*100:.1f}%)...")
+    print(f"Preparing time-split data (Val split: {val_split_ratio*100:.1f}%, Predict Delta: {config.PREDICT_DELTA}, Predict SinCos: {config.PREDICT_SINCOS_OUTPUT})...")
     required_cols = ['theta', 'theta_dot', 'tau']
-
     if df_all is None or df_all.empty or not all(col in df_all.columns for col in required_cols):
         print("Error: Input DataFrame invalid."); return (None,) * 4
 
-    use_sincos = config.USE_SINCOS_THETA
-    predict_delta = False # Assuming Seq2Seq predicts absolute states
-    print(f"Using sin/cos features: {use_sincos}, Predicting absolute state sequence.")
-
-    # --- Create ALL Sequences ---
-    print("Creating all sequences from combined data, respecting simulation boundaries...")
+    print("Creating all sequences from combined data...")
     data_values = df_all[required_cols].values
-    
-    # 创建序列，考虑模拟边界
     X_all, y_all = create_sequences(
-        data_values, 
-        simulation_boundaries=simulation_boundaries,
-        input_seq_len=input_sequence_length, 
-        output_seq_len=output_sequence_length, 
-        use_sincos=use_sincos
+        data_values, simulation_boundaries=simulation_boundaries,
+        input_seq_len=input_sequence_length, output_seq_len=output_sequence_length,
+        use_sincos=config.USE_SINCOS_THETA, predict_delta=config.PREDICT_DELTA,
+        predict_sincos_output=config.PREDICT_SINCOS_OUTPUT
     )
 
-    if X_all.shape[0] == 0 or y_all.shape[0] == 0:
-        print("Error: No sequences created."); return (None,) * 4
-    print(f"Total sequences created: {len(X_all)}")
+    if X_all.shape[0] == 0 or y_all.shape[0] == 0: print("Error: No sequences created."); return (None,) * 4
+    num_output_features = y_all.shape[2]
+    print(f"Total sequences created: {len(X_all)}, Output features: {num_output_features}")
 
-    # --- Chronological Train/Validation Split ---
-    print("Performing chronological split on sequences...")
-    total_sequences = len(X_all)
-    split_index = int(total_sequences * (1 - val_split_ratio))
-
+    print("Performing chronological split...")
+    total_sequences = len(X_all); split_index = int(total_sequences * (1 - val_split_ratio))
     if split_index <= 0 or split_index >= total_sequences:
-        print(f"Warning: Chronological split resulted in empty train ({split_index<=0}) or validation ({split_index>=total_sequences}) set.")
+        print(f"Warning: Chronological split resulted in empty train or validation set.")
         if split_index <= 0: print("Error: Training set empty."); return (None,) * 4
         else: X_train, X_val, y_train, y_val = X_all, np.empty((0, *X_all.shape[1:])), y_all, np.empty((0, *y_all.shape[1:])); print("Warning: Validation set empty.")
     else:
         X_train, X_val = X_all[:split_index], X_all[split_index:]
         y_train, y_val = y_all[:split_index], y_all[split_index:]
-
     print(f"Train sequences: {len(X_train)}, Validation sequences: {len(X_val)}")
 
-    # --- Shuffle ONLY Training Data ---
-    indices = np.arange(len(X_train))
-    np.random.seed(seed); np.random.shuffle(indices)
+    indices = np.arange(len(X_train)); np.random.seed(seed); np.random.shuffle(indices)
     X_train, y_train = X_train[indices], y_train[indices]
     print("Training sequences shuffled.")
 
-    # --- Scaling ---
-    num_input_features = X_train.shape[2]; num_output_features = y_train.shape[2]
+    num_input_features = X_train.shape[2]
     X_train_reshaped = X_train.reshape(-1, num_input_features)
     X_val_reshaped = X_val.reshape(-1, num_input_features) if X_val.shape[0] > 0 else np.empty((0, num_input_features))
     y_train_reshaped = y_train.reshape(-1, num_output_features)
@@ -148,10 +123,10 @@ def prepare_timesplit_seq2seq_data(df_all, simulation_boundaries=None, input_seq
 
     if config.INPUT_SCALER_TYPE.lower() == "standardscaler": input_scaler = StandardScaler()
     else: input_scaler = MinMaxScaler(feature_range=(-1, 1))
-    print(f"Using {config.INPUT_SCALER_TYPE} for input features (X).")
-    if config.TARGET_SCALER_TYPE == "StandardScaler": target_scaler = StandardScaler()
+    if config.TARGET_SCALER_TYPE.lower() == "standardscaler": target_scaler = StandardScaler()
     else: target_scaler = MinMaxScaler(feature_range=(-1, 1))
-    print(f"Using {config.TARGET_SCALER_TYPE} for target variable (y).")
+    target_desc = "Sin/Cos/Dot" if config.PREDICT_SINCOS_OUTPUT else ("Delta States" if config.PREDICT_DELTA else "Absolute States")
+    print(f"Using {config.INPUT_SCALER_TYPE} for input (X), {config.TARGET_SCALER_TYPE} for target (y - {target_desc}).")
 
     try:
         print("Fitting scalers on training data..."); start_fit_time = time.time()
@@ -164,7 +139,9 @@ def prepare_timesplit_seq2seq_data(df_all, simulation_boundaries=None, input_seq
     except Exception as e: print(f"Error fitting or saving scalers: {e}"); return (None,) * 4
 
     if X_val_reshaped.shape[0] > 0:
-         try: X_val_scaled_reshaped = input_scaler.transform(X_val_reshaped); y_val_scaled_reshaped = target_scaler.transform(y_val_reshaped)
+         try:
+             X_val_scaled_reshaped = input_scaler.transform(X_val_reshaped)
+             y_val_scaled_reshaped = target_scaler.transform(y_val_reshaped)
          except Exception as e: print(f"Error scaling validation data: {e}"); return (None, None, input_scaler, target_scaler)
     else: y_val_scaled_reshaped = np.empty((0, num_output_features))
 
@@ -173,165 +150,116 @@ def prepare_timesplit_seq2seq_data(df_all, simulation_boundaries=None, input_seq
     y_train_scaled = y_train_scaled_reshaped.reshape(y_train.shape)
     y_val_scaled = y_val_scaled_reshaped.reshape(y_val.shape) if y_val.shape[0] > 0 else np.empty((0, output_sequence_length, num_output_features))
 
-    # --- Create Tensors and DataLoaders (针对M2 Max优化) ---
+    # *** ADDED: Print statistics of scaled targets ***
+    print("\n--- Scaled Target Statistics ---")
+    if len(y_train_scaled) > 0:
+        print(f"Scaled Training Targets (y_train_scaled) Shape: {y_train_scaled.shape}")
+        # Reshape to 2D for easier stats calculation per feature
+        y_train_scaled_2d = y_train_scaled.reshape(-1, num_output_features)
+        print(f"  Min per feature : {np.min(y_train_scaled_2d, axis=0)}")
+        print(f"  Max per feature : {np.max(y_train_scaled_2d, axis=0)}")
+        print(f"  Mean per feature: {np.mean(y_train_scaled_2d, axis=0)}")
+        print(f"  Std per feature : {np.std(y_train_scaled_2d, axis=0)}")
+    else:
+        print("Scaled Training Targets: Empty")
+
+    if len(y_val_scaled) > 0:
+        print(f"Scaled Validation Targets (y_val_scaled) Shape: {y_val_scaled.shape}")
+        y_val_scaled_2d = y_val_scaled.reshape(-1, num_output_features)
+        print(f"  Min per feature : {np.min(y_val_scaled_2d, axis=0)}")
+        print(f"  Max per feature : {np.max(y_val_scaled_2d, axis=0)}")
+        print(f"  Mean per feature: {np.mean(y_val_scaled_2d, axis=0)}")
+        print(f"  Std per feature : {np.std(y_val_scaled_2d, axis=0)}")
+    else:
+        print("Scaled Validation Targets: Empty")
+    print("---------------------------------\n")
+    # *** END OF ADDED PRINT ***
+
+    # Create Tensors and DataLoaders
     try:
-        # 创建张量
         X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
         y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32)
         X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32)
         y_val_tensor = torch.tensor(y_val_scaled, dtype=torch.float32)
-        
-        # 创建数据集
+
         train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
         val_dataset = TensorDataset(X_val_tensor, y_val_tensor) if X_val_tensor.shape[0] > 0 else None
-        
-        # 检测CPU核心数以优化num_workers
+
         import multiprocessing
-        num_workers = min(4, max(2, multiprocessing.cpu_count() // 2))  # 使用一半的CPU核心数，但至少2个，最多4个
-        print(f"使用 {num_workers} 个工作进程加载数据")
-        
-        # 针对M2 Max优化的DataLoader参数
-        # - pin_memory=True: 加速CPU到GPU的数据传输
-        # - persistent_workers=True: 保持工作进程活跃，减少创建/销毁开销
-        # - prefetch_factor=2: 每个工作进程预取的批次数
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=config.BATCH_SIZE,
-            shuffle=True, 
-            pin_memory=True,
-            num_workers=num_workers,
-            persistent_workers=True,
-            prefetch_factor=2,
-        )
-        
-        # 验证集dataloader (如果有验证集)
-        if val_dataset:
-            val_loader = DataLoader(
-                val_dataset, 
-                batch_size=config.BATCH_SIZE * 2,  # 验证时可使用更大批次
-                shuffle=False, 
-                pin_memory=True,
-                num_workers=num_workers,
-                persistent_workers=True,
-                prefetch_factor=2,
-            )
-        else:
-            val_loader = None
-            
-        print(f"DataLoaders创建完成! 训练批次: {len(train_loader)}, 验证批次: {len(val_loader) if val_loader else 0}")
-        if val_loader is None:
-            print("警告: 验证DataLoader为空。")
-    except Exception as e:
-        print(f"创建Tensors或DataLoaders时出错: {e}")
-        return (None, None, input_scaler, target_scaler)
+        num_workers = min(4, max(2, multiprocessing.cpu_count() // 2))
+        # print(f"Using {num_workers} worker processes for DataLoaders.") # Less verbose
+
+        train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=num_workers, persistent_workers=True, prefetch_factor=2)
+        val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE * 2, shuffle=False, pin_memory=True, num_workers=num_workers, persistent_workers=True, prefetch_factor=2) if val_dataset else None
+        print(f"DataLoaders created. Train batches: {len(train_loader)}, Val batches: {len(val_loader) if val_loader else 0}")
+        if val_loader is None: print("Warning: Validation DataLoader is None.")
+
+    except Exception as e: print(f"Error creating Tensors or DataLoaders: {e}"); return (None, None, input_scaler, target_scaler)
 
     return train_loader, val_loader, input_scaler, target_scaler
 
 
-# --- Modified get_test_data_and_scalers for Chronological Split with Simulation Boundaries ---
-def get_test_data_and_scalers(data_path=config.COMBINED_DATA_FILE, # Load the combined file
-                              simulation_boundaries=None, # 新增模拟边界参数
-                              sequence_length=config.INPUT_SEQ_LEN,
-                              output_sequence_length=config.OUTPUT_SEQ_LEN, # Needed for create_sequences
-                              val_split_ratio=config.VALIDATION_SPLIT, # Use this to find the val part
-                              input_scaler_path=config.INPUT_SCALER_PATH,
+# --- Function to load test data ---
+# (No changes needed here)
+def get_test_data_and_scalers(data_path=config.COMBINED_DATA_FILE, simulation_boundaries=None,
+                              sequence_length=config.INPUT_SEQ_LEN, output_sequence_length=config.OUTPUT_SEQ_LEN,
+                              val_split_ratio=config.VALIDATION_SPLIT, input_scaler_path=config.INPUT_SCALER_PATH,
                               target_scaler_path=config.TARGET_SCALER_PATH):
-    """
-    Loads scalers and prepares the validation/test set sequences (X_val_scaled)
-    and the corresponding future dataframe slice (df_for_pred) based on a
-    chronological split of the data loaded from data_path.
+    """Loads scalers and prepares validation/test sequences and future dataframe slice."""
+    print(f"Loading scalers and preparing evaluation data from: {data_path}")
+    print(f"  Input Scaler: {input_scaler_path}")
+    print(f"  Target Scaler: {target_scaler_path} (Type: {config.TARGET_SCALER_TYPE}, Predict SinCos: {config.PREDICT_SINCOS_OUTPUT})")
 
-    Args:
-        data_path (str): Path to the combined dataset CSV file.
-        simulation_boundaries (list): 指示不同模拟边界的行索引列表.
-        sequence_length (int): Length of input sequences (N).
-        output_sequence_length (int): Length of output sequences (K).
-        val_split_ratio (float): Proportion used for validation set during training.
-        input_scaler_path (str): Path to the fitted input scaler.
-        target_scaler_path (str): Path to the fitted target scaler.
-
-    Returns:
-        tuple: (X_val_scaled, df_for_pred, input_scaler, target_scaler)
-               Returns (None, None, None, None) if an error occurs.
-    """
-    print(f"Loading scalers and preparing evaluation data (time split) from: {data_path}")
-    # --- Load Scalers ---
     try:
-        if not os.path.exists(input_scaler_path) or not os.path.exists(target_scaler_path):
-             raise FileNotFoundError(f"Scaler file(s) not found: {input_scaler_path}, {target_scaler_path}")
-        input_scaler = joblib.load(input_scaler_path)
-        target_scaler = joblib.load(target_scaler_path)
-        print(f"Scalers loaded ({input_scaler_path}, {target_scaler_path}).")
+        if not os.path.exists(input_scaler_path) or not os.path.exists(target_scaler_path): raise FileNotFoundError(f"Scaler file(s) not found")
+        input_scaler = joblib.load(input_scaler_path); target_scaler = joblib.load(target_scaler_path)
+        print(f"Scalers loaded successfully.")
         if not hasattr(input_scaler, 'scale_') and not hasattr(input_scaler, 'min_'): raise ValueError("Input scaler not fitted.")
-        if not hasattr(target_scaler, 'scale_') and not hasattr(target_scaler, 'min_'): raise ValueError("Target scaler not fitted.")
+        if not hasattr(target_scaler, 'scale_'): raise ValueError("Target scaler does not appear to be fitted.")
     except Exception as e: print(f"Error loading scalers: {e}"); return None, None, None, None
 
-    # --- Load Combined Data File ---
     try:
         df_all = pd.read_csv(data_path)
-        if df_all.empty: raise ValueError("Evaluation data file is empty.")
-    except FileNotFoundError: print(f"Error: Combined data file not found at {data_path}"); return None, None, input_scaler, target_scaler
-    except Exception as e: print(f"Error loading combined data: {e}"); return None, None, input_scaler, target_scaler
+        if df_all.empty: raise ValueError("Data file is empty.")
+        boundaries_file = data_path.replace('.csv', '_boundaries.npy')
+        if simulation_boundaries is None and not config.USE_DOWNSAMPLING and os.path.exists(boundaries_file):
+             try: simulation_boundaries = list(np.load(boundaries_file)); print(f"Loaded boundaries")
+             except Exception as be: print(f"Warning: Error loading boundaries file: {be}"); simulation_boundaries = None
+        elif config.USE_DOWNSAMPLING: simulation_boundaries = None; print("Info: Downsampling used, no boundaries loaded.")
+    except Exception as e: print(f"Error loading data: {e}"); return None, None, input_scaler, target_scaler
 
-    # --- Prepare Data for Evaluation ---
     required_cols = ['theta', 'theta_dot', 'tau', 'time']
-    if not all(col in df_all.columns for col in required_cols):
-        print("Error: Combined DataFrame missing required columns."); return None, None, input_scaler, target_scaler
+    if not all(col in df_all.columns for col in required_cols): print("Error: Missing required columns."); return None, None, input_scaler, target_scaler
 
-    # Create ALL sequences from the combined data
-    # Use config flag for feature engineering consistency
     use_sincos = config.USE_SINCOS_THETA
-    # Use predict_delta=False because we need X sequences of absolute states
+    predict_delta_eval = config.PREDICT_DELTA
+    predict_sincos_eval = config.PREDICT_SINCOS_OUTPUT
     data_values = df_all[required_cols[:3]].values
-    print("Creating all sequences to determine validation split...")
+    print(f"Creating sequences for validation split (Delta: {predict_delta_eval}, SinCosOut: {predict_sincos_eval})...")
     X_all, _ = create_sequences(
-        data_values, 
-        simulation_boundaries=simulation_boundaries,  # 传入模拟边界
-        input_seq_len=sequence_length, 
-        output_seq_len=output_sequence_length, 
-        use_sincos=use_sincos
+        data_values, simulation_boundaries=simulation_boundaries, input_seq_len=sequence_length,
+        output_seq_len=output_sequence_length, use_sincos=use_sincos,
+        predict_delta=predict_delta_eval, predict_sincos_output=predict_sincos_eval
     )
 
-    if X_all.shape[0] == 0:
-        print("Error: No sequences created from combined data file."); return None, None, input_scaler, target_scaler
+    if X_all.shape[0] == 0: print("Error: No sequences created."); return None, None, input_scaler, target_scaler
 
-    # Perform chronological split to get the validation sequences (X_val)
-    total_sequences = len(X_all)
-    split_index = int(total_sequences * (1 - val_split_ratio))
-    if split_index >= total_sequences:
-        print("Warning: Validation split is empty based on ratio and data length."); return np.empty((0, sequence_length, X_all.shape[2])), pd.DataFrame(), input_scaler, target_scaler
+    total_sequences = len(X_all); split_index = int(total_sequences * (1 - val_split_ratio))
+    if split_index >= total_sequences: print("Warning: Validation split empty."); return np.empty((0,)), pd.DataFrame(), input_scaler, target_scaler
     X_val = X_all[split_index:]
+    if X_val.shape[0] == 0: print("Warning: X_val empty."); return np.empty((0,)), pd.DataFrame(), input_scaler, target_scaler
 
-    if X_val.shape[0] == 0:
-        print("Warning: X_val is empty after chronological split."); return np.empty((0, sequence_length, X_all.shape[2])), pd.DataFrame(), input_scaler, target_scaler
-
-    # Scale the validation input sequences (X_val) using the loaded input scaler
     try:
-        # Check feature consistency
-        if input_scaler.n_features_in_ != X_val.shape[2]:
-             raise ValueError(f"Input scaler expects {input_scaler.n_features_in_} features, but data sequence has {X_val.shape[2]}. Check USE_SINCOS_THETA consistency.")
-        X_val_reshaped = X_val.reshape(-1, X_val.shape[2])
-        X_val_scaled = input_scaler.transform(X_val_reshaped).reshape(X_val.shape)
-    except Exception as e: print(f"Error scaling validation data sequences: {e}"); return None, None, input_scaler, target_scaler
+        if input_scaler.n_features_in_ != X_val.shape[2]: raise ValueError(f"Input scaler feature mismatch.")
+        X_val_scaled = input_scaler.transform(X_val.reshape(-1, X_val.shape[2])).reshape(X_val.shape)
+    except Exception as e: print(f"Error scaling validation data: {e}"); return None, None, input_scaler, target_scaler
 
-    # Prepare the dataframe slice needed for multi-step prediction ground truth
-    # This slice corresponds to the time steps *after* the validation sequences start
-    # The first validation sequence starts at index split_index in X_all
-    # This sequence uses data from df_all index split_index to split_index + sequence_length - 1
-    # The first prediction target corresponds to df_all index split_index + sequence_length
     start_index_in_df_for_pred = split_index + sequence_length
-    if start_index_in_df_for_pred >= len(df_all):
-        print("Error: Cannot get DataFrame slice for prediction (index out of bounds)."); return X_val_scaled, pd.DataFrame(), input_scaler, target_scaler
+    if start_index_in_df_for_pred >= len(df_all): print("Error: Cannot get DataFrame slice for prediction."); return X_val_scaled, pd.DataFrame(), input_scaler, target_scaler
     df_for_pred = df_all.iloc[start_index_in_df_for_pred:].reset_index(drop=True)
 
     print(f"Validation sequences shape for evaluation: {X_val_scaled.shape}")
     print(f"DataFrame slice for prediction length: {len(df_for_pred)}")
 
-    # Return scaled validation sequences, the prediction df slice, and both scalers
     return X_val_scaled, df_for_pred, input_scaler, target_scaler
-
-
-# --- Comment out or remove old/unused functions ---
-# def prepare_shuffled_train_val_data(...): ...
-# def prepare_train_val_data_from_dfs(...): ...
 
