@@ -115,10 +115,10 @@ if __name__ == "__main__":
     parser.add_argument('--rnn_type', type=str, default='lstm', choices=['lstm', 'gru'], help='RNN type (must match trained model)')
     parser.add_argument('--seq_length', type=int, default=150, help='Sequence length used during training') # Match training
     # Initial conditions and force parameters for simulation
-    parser.add_argument('--theta0', type=float, default=1.5, help='Initial angle (rad)')
+    parser.add_argument('--theta0', type=float, default=0.5, help='Initial angle (rad)')
     parser.add_argument('--omega0', type=float, default=0.2, help='Initial angular velocity (rad/s)')
-    parser.add_argument('--amp', type=float, default=0.5, help='Force amplitude')
-    parser.add_argument('--freq', type=float, default=1.0, help='Force frequency')
+    parser.add_argument('--amp', type=float, default=1.0, help='Force amplitude')
+    parser.add_argument('--freq', type=float, default=10.0, help='Force frequency')
     # Other parameters
     parser.add_argument('--sim_steps', type=int, default=2000, help='Number of steps to simulate/predict for animation')
     parser.add_argument('--dt', type=float, default=0.02, help='Time step')
